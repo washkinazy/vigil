@@ -6,6 +6,13 @@ publish.workspace = true
 description = "Session idle manager daemon"
 
 [dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+zbus.workspace = true
+futures-util.workspace = true
+wayland-client.workspace = true
+wayland-protocols.workspace = true
 vigil-core.workspace = true
 
 [lints]

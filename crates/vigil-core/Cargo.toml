@@ -7,3 +7,8 @@ description = "Session idle policy and state for Vigil"
 
 [lints]
 workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true

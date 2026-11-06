@@ -6,6 +6,8 @@ publish.workspace = true
 description = "Control interface for Vigil"
 
 [dependencies]
+serde_json.workspace = true
+tokio.workspace = true
 vigil-core.workspace = true
 
 [lints]
