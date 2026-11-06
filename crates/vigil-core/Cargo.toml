@@ -1,0 +1,9 @@
+[package]
+name = "vigil-core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Session idle policy and state for Vigil"
+
+[lints]
+workspace = true
