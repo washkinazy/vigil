@@ -1,0 +1,13 @@
+[Unit]
+Description=Vigil session idle manager
+PartOf=graphical-session.target
+After=graphical-session.target
+ConditionEnvironment=WAYLAND_DISPLAY
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/vigild
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=10
+Slice=session.slice
