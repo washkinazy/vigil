@@ -2,10 +2,10 @@ use crate::{Event, actions};
 use futures_util::StreamExt;
 use std::time::Duration;
 use tokio::{
-    sync::mpsc::UnboundedSender,
+    sync::{mpsc::UnboundedSender, watch},
     time::{sleep, timeout},
 };
-use vigil_core::{ACTIONS, Commands, Inhibitor};
+use vigil_core::{ACTIONS, Config, Inhibitor};
 use zbus::{
     Connection, Proxy,
     zvariant::{OwnedFd, OwnedObjectPath},
@@ -47,17 +47,21 @@ async fn delay(m: &Proxy<'_>) -> Result<OwnedFd, String> {
     .await
     .map_err(|e| e.to_string())
 }
-pub fn start(tx: UnboundedSender<Event>, commands: Commands, dry: bool) {
+pub fn start(tx: UnboundedSender<Event>, config: watch::Receiver<(u64, Config)>, dry: bool) {
     tokio::spawn(async move {
         loop {
-            if let Err(e) = monitor(tx.clone(), commands.clone(), dry).await {
+            if let Err(e) = monitor(tx.clone(), config.clone(), dry).await {
                 let _ = tx.send(Event::Health("logind".into(), Some(e)));
             }
             sleep(Duration::from_secs(2)).await;
         }
     });
 }
-async fn monitor(tx: UnboundedSender<Event>, commands: Commands, dry: bool) -> Result<(), String> {
+async fn monitor(
+    tx: UnboundedSender<Event>,
+    config: watch::Receiver<(u64, Config)>,
+    dry: bool,
+) -> Result<(), String> {
     let c = Connection::system().await.map_err(|e| e.to_string())?;
     let m = manager(&c).await?;
     let path: OwnedObjectPath = m
@@ -99,6 +103,7 @@ async fn monitor(tx: UnboundedSender<Event>, commands: Commands, dry: bool) -> R
           let _=tx.send(Event::Sleep(preparing));
           if preparing {
            if !dry {
+            let commands = config.borrow().1.commands.clone();
             let result=timeout(budget,actions::lock(&commands,commands.lock_timeout_seconds)).await;
             let error=match result {Ok(Ok(()))=>None,Ok(Err(e))=>Some(e),Err(_)=>Some("external sleep lock deadline expired; logind cannot be delayed indefinitely".into())};
             let _=tx.send(Event::Health("sleep-lock".into(),error));

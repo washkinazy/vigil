@@ -85,7 +85,11 @@ previous startup entries, and start the old idle services.
 
 Use [config.example.toml](config.example.toml) as the configuration reference.
 Unknown keys, invalid scopes, and unsafe empty commands fail validation. Changes
-require `vigild --check-config` followed by `systemctl --user restart vigil`.
+can be applied with `vigilctl reload` or `systemctl --user reload vigil`. Invalid TOML leaves the current configuration
+untouched. Successful reload resets idle timers, preserves manual overrides,
+restores blanked displays using the previous command, and refreshes sensor policy.
+Automatic actions wait for a fresh observation; stale pre-reload observations are
+discarded. Sleep preparation uses the latest validated locker settings.
 
 ## Controls and Waybar
 
@@ -96,7 +100,8 @@ vigilctl keep-awake 1h
 vigilctl keep-awake 30m --scope suspend
 vigilctl keep-awake                 # until cleared or daemon restart
 vigilctl automatic
-vigilctl toggle                     # toggle manual all-action keep-awake
+vigilctl toggle                     # atomically toggle manual all-action keep-awake
+vigilctl reload                     # validate and apply TOML without restarting
 vigilctl lock
 vigilctl suspend
 vigilctl wake
@@ -141,7 +146,9 @@ locks, blanks, suspends, or acquires a sleep delay inhibitor. It has an independ
 control socket and does not replace running idle services.
 
 `just check` runs formatting, Clippy with warnings denied, policy/adapter/runtime
-unit tests, debug builds, and documentation builds. Tests cover overlapping
+unit tests, debug builds, and documentation builds. `just smoke` runs an isolated
+dry-run instance against the current session, including concurrent control calls
+and valid/invalid configuration reloads. Tests cover overlapping
 inhibitors, expiry/grace, action scopes, continuous input, reconnection, resume,
 muted/dummy streams, fullscreen visibility, command timeouts, and lock-before-sleep
 ordering. Live lock/suspend testing is intentionally separate from unit/dry-run
@@ -164,12 +171,12 @@ validation because it interrupts the desktop.
   PipeWire observation blocks suspend. Other backend failures appear in health.
   Missing MPRIS/fullscreen/logind observations cannot reconstruct unknown activity.
 - Manual overrides are process-local. Only one manual override exists; a new one
-  replaces it. `toggle` is a convenience client read/modify operation.
+  replaces it. `toggle` runs atomically in the daemon, including concurrent clients.
 - Optional Redshift automation is not implemented. It needs state-aware ownership
   and restoration so automation cannot undo a later manual decision.
 - This implements the core idle lifecycle, not swayidle's shell-command language,
   arbitrary timeout hooks, or every compositor-specific feature. IdleHint export,
-  additional compositor adapters, and configuration reload are not implemented.
+  and additional compositor adapters are not implemented.
 
 `vigil-core` contains deterministic policy and TOML types; `vigild` owns I/O and
 policy execution; `vigilctl` renders the daemon's decisions. Host package selection

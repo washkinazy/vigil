@@ -78,7 +78,7 @@ async fn start() -> Result<(), String> {
     }
     if args == ["--help"] || args == ["-h"] {
         println!(
-            "vigilctl [--socket PATH] COMMAND\n\nstatus [--json]\nwaybar [--watch]\nkeep-awake [DURATION] [--scope display,lock,suspend]\nautomatic\ntoggle\nlock\nsuspend\nwake\n\nDurations: 30s, 20m, 1h, 1d. Omitted duration lasts until automatic or restart.\nExplicit lock/suspend commands bypass activity inhibitors; suspend requires confirmed lock."
+            "vigilctl [--socket PATH] COMMAND\n\nstatus [--json]\nwaybar [--watch]\nkeep-awake [DURATION] [--scope display,lock,suspend]\nautomatic\ntoggle\nreload\nlock\nsuspend\nwake\n\nDurations: 30s, 20m, 1h, 1d. Omitted duration lasts until automatic or restart.\nExplicit lock/suspend commands bypass activity inhibitors; suspend requires confirmed lock."
         );
         return Ok(());
     }
@@ -102,7 +102,8 @@ async fn start() -> Result<(), String> {
         "lock" if args.len() == 1 => Request::Lock,
         "suspend" if args.len() == 1 => Request::Suspend,
         "wake" if args.len() == 1 => Request::Wake,
-        "toggle" if args.len() == 1 => Request::Status,
+        "toggle" if args.len() == 1 => Request::Toggle,
+        "reload" if args.len() == 1 => Request::Reload,
         "keep-awake" => {
             let mut seconds = None;
             let mut scope = ACTIONS.to_vec();
@@ -130,10 +131,13 @@ async fn start() -> Result<(), String> {
         }
         _ => return Err("unsupported command or arguments; see --help".into()),
     };
-    let path = socket.unwrap_or(
-        PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").ok_or("XDG_RUNTIME_DIR is required")?)
-            .join("vigil/control.sock"),
-    );
+    let path = match socket {
+        Some(path) => path,
+        None => {
+            PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").ok_or("XDG_RUNTIME_DIR is required")?)
+                .join("vigil/control.sock")
+        }
+    };
     loop {
         let response = request(&path, request_kind.clone()).await;
         if cmd == "waybar" {
@@ -150,25 +154,7 @@ async fn start() -> Result<(), String> {
             }
             return Ok(());
         }
-        let mut response = response?;
-        if cmd == "toggle" {
-            let active = response
-                .status
-                .as_ref()
-                .is_some_and(|s| s.inhibitors.iter().any(|i| i.id == "manual"));
-            response = request(
-                &path,
-                if active {
-                    Request::Automatic
-                } else {
-                    Request::KeepAwake {
-                        seconds: None,
-                        scope: ACTIONS.to_vec(),
-                    }
-                },
-            )
-            .await?;
-        }
+        let response = response?;
         if cmd == "status" {
             let s = response.status.ok_or("missing status")?;
             if args.len() == 2 {

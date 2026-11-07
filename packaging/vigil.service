@@ -7,6 +7,7 @@ ConditionEnvironment=WAYLAND_DISPLAY
 [Service]
 Type=exec
 ExecStart=%h/.local/bin/vigild
+ExecReload=%h/.local/bin/vigilctl reload
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=10
