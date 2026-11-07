@@ -57,12 +57,13 @@ with tempfile.TemporaryDirectory(prefix="vigil-tray-") as directory:
             bus("call", name, "/MenuBar", "com.canonical.dbusmenu", "Event", "isvu", str(ident), "clicked", "i", "0", "0")
         wait_for(lambda: "Enabled" in title())
         assert item("Enabled")[1]["toggle-state"]["data"] == 1
-        assert [item(f"{n} minutes") is not None for n in (30, 60, 90)] == [True] * 3
+        assert all(not child["data"][2] for child in layout()[2]), "menu must stay flat"
+        assert [item(f"Disable for {n} minutes") is not None for n in (30, 60, 90)] == [True] * 3
         bus("call", name, "/StatusNotifierItem", "org.kde.StatusNotifierItem", "Activate", "ii", "0", "0")
         wait_for(lambda: "Disabled" in title())
         assert any(m["id"] == "manual:toggle" for m in status()["manual_inhibitors"])
         for minutes in (30, 60, 90):
-            click(f"{minutes} minutes")
+            click(f"Disable for {minutes} minutes")
             wait_for(lambda: f"{minutes} min" in title())
             current = next(m for m in status()["manual_inhibitors"] if m["id"] == "manual:toggle")
             assert minutes * 60 - 10 <= current["remaining_seconds"] <= minutes * 60
