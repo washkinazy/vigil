@@ -1,3 +1,4 @@
+mod tray;
 mod watcher;
 use std::{path::PathBuf, time::Duration};
 use tokio::{
@@ -103,7 +104,7 @@ async fn start() -> Result<(), String> {
     }
     if args == ["--help"] || args == ["-h"] {
         println!(
-            "vigilctl [--socket PATH] COMMAND\n\nstatus [--json]\nexplain display|lock|suspend\nwaybar [--watch]\nkeep-awake [DURATION] [--scope display,lock,suspend] [--reason TEXT]\nrelease ID\nautomatic\ntoggle\nreload\nlock\nsuspend\nwake\n\nDurations: 30s, 20m, 1h, 1d. Each keep-awake prints its ID. Omitted duration lasts until released.\nrelease removes one request; automatic clears all manual requests.\ntoggle controls its own all-action request and preserves other requests.\nExplicit lock/suspend commands bypass activity inhibitors; suspend requires confirmed lock."
+            "vigilctl [--socket PATH] COMMAND\n\nstatus [--json]\nexplain display|lock|suspend\nwaybar [--watch]\ntray\nkeep-awake [DURATION] [--scope display,lock,suspend] [--reason TEXT]\nrelease ID\nautomatic\ntoggle\nreload\nlock\nsuspend\nwake\n\nDurations: 30s, 20m, 1h, 1d. Each keep-awake prints its ID. Omitted duration lasts until released.\nrelease removes one request; automatic clears all manual requests.\ntoggle controls its own all-action request and preserves other requests.\nExplicit lock/suspend commands bypass activity inhibitors; suspend requires confirmed lock."
         );
         return Ok(());
     }
@@ -131,6 +132,7 @@ async fn start() -> Result<(), String> {
                 _ => return Err("explain requires display, lock, or suspend".into()),
             },
         },
+        "tray" if args.len() == 1 => Request::Status,
         "automatic" if args.len() == 1 => Request::Automatic,
         "release" if args.len() == 2 => Request::Release {
             id: args[1].clone(),
@@ -181,6 +183,9 @@ async fn start() -> Result<(), String> {
                 .join("vigil/control.sock")
         }
     };
+    if cmd == "tray" {
+        return tray::run(path).await;
+    }
     let watcher = if cmd == "waybar" && args.len() == 2 {
         Some(watcher::Executable::current()?)
     } else {
