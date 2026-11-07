@@ -14,7 +14,7 @@ struct Indicator {
     commands: mpsc::Sender<Request>,
 }
 impl Indicator {
-    fn disabled(&self) -> bool {
+    fn keep_awake(&self) -> bool {
         self.status.as_ref().is_some_and(|s| s.caffeine.is_some())
     }
     fn available(&self) -> bool {
@@ -32,11 +32,7 @@ impl Indicator {
         let Some(status) = &self.status else {
             return "Vigil — Unavailable".into();
         };
-        let state = crate::label(status);
-        format!(
-            "Vigil — {state}{}",
-            if status.dry_run { " (dry-run)" } else { "" }
-        )
+        crate::heading(status)
     }
 }
 impl ksni::Tray for Indicator {
@@ -51,7 +47,7 @@ impl ksni::Tray for Indicator {
     }
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
         icons(
-            self.disabled()
+            self.keep_awake()
                 || self
                     .status
                     .as_ref()
@@ -62,11 +58,12 @@ impl ksni::Tray for Indicator {
     fn tool_tip(&self) -> ksni::ToolTip {
         ksni::ToolTip {
             title: self.label(),
-            description: self
-                .error
-                .as_deref()
-                .map(markup)
-                .unwrap_or_else(|| self.status.as_ref().map(crate::tooltip).unwrap_or_default()),
+            description: self.error.as_deref().map(markup).unwrap_or_else(|| {
+                self.status
+                    .as_ref()
+                    .map(crate::tooltip_details)
+                    .unwrap_or_default()
+            }),
             ..Default::default()
         }
     }
@@ -74,7 +71,7 @@ impl ksni::Tray for Indicator {
         let mut menu = vec![
             CheckmarkItem {
                 label: "Keep awake".into(),
-                checked: self.disabled(),
+                checked: self.keep_awake(),
                 enabled: self.available(),
                 activate: Box::new(|tray: &mut Self| tray.send(Request::Toggle)),
                 ..Default::default()
@@ -215,7 +212,7 @@ mod tests {
         tray.activate(0, 0);
         assert!(matches!(received.recv().await, Some(Request::Toggle)));
         assert!(tray.pending);
-        assert!(!tray.disabled());
+        assert!(!tray.keep_awake());
         tray.pending = false;
         let menu = tray.menu();
         assert!(
@@ -256,6 +253,36 @@ mod tests {
         }
     }
     #[test]
+    fn tooltip_has_one_heading_and_keeps_additional_reasons_and_warnings() {
+        let (mut tray, _) = indicator();
+        assert_eq!(tray.tool_tip().title, "Vigil — Automatic");
+        assert!(tray.tool_tip().description.is_empty());
+        let status = tray.status.as_mut().unwrap();
+        status.caffeine = Some(vigil_core::CaffeineStatus {
+            remaining_seconds: Some(1800),
+        });
+        status.inhibitors.push(vigil_core::Inhibitor {
+            id: "caffeine".into(),
+            reason: "Keep awake".into(),
+            scope: vigil_core::ACTIONS.to_vec(),
+        });
+        assert_eq!(tray.tool_tip().title, "Vigil — Keep awake — 30 min");
+        assert!(tray.tool_tip().description.is_empty());
+        let status = tray.status.as_mut().unwrap();
+        status.inhibitors.push(vigil_core::Inhibitor {
+            id: "audio".into(),
+            reason: "Music <&>".into(),
+            scope: vigil_core::ACTIONS.to_vec(),
+        });
+        status
+            .health
+            .insert("mpris".into(), "Unavailable <&>".into());
+        assert_eq!(
+            tray.tool_tip().description,
+            "Music &lt;&amp;&gt;\nmpris: Unavailable &lt;&amp;&gt;"
+        );
+    }
+    #[test]
     fn application_pause_is_visible_without_enabling_caffeine() {
         let (mut tray, mut received) = indicator();
         tray.status
@@ -269,7 +296,7 @@ mod tests {
             });
         assert_eq!(tray.label(), "Vigil — Paused: Music");
         assert_eq!(tray.icon_pixmap()[0].data, icons(true, false)[0].data);
-        assert!(tray.tool_tip().description.contains("Music"));
+        assert!(tray.tool_tip().description.is_empty());
         let menu = tray.menu();
         let ksni::MenuItem::Checkmark(item) = &menu[0] else {
             panic!("missing Keep awake")

@@ -41,20 +41,40 @@ fn label(s: &Status) -> String {
         "Automatic".into()
     }
 }
-fn tooltip(s: &Status) -> String {
-    let mut lines = vec![format!(
+fn heading(s: &Status) -> String {
+    format!(
         "Vigil — {}{}",
         label(s),
         if s.dry_run { " (dry-run)" } else { "" }
-    )];
-    lines.extend(s.inhibitors.iter().map(|i| i.reason.clone()));
+    )
+}
+fn tooltip_details(s: &Status) -> String {
+    let title_reason = s.caffeine.is_none().then(|| s.inhibitors.first()).flatten();
+    let mut lines = Vec::new();
+    for inhibitor in &s.inhibitors {
+        if inhibitor.id == "caffeine"
+            || title_reason.is_some_and(|first| first.reason == inhibitor.reason)
+            || lines.contains(&inhibitor.reason)
+        {
+            continue;
+        }
+        lines.push(inhibitor.reason.clone());
+    }
     lines.extend(
         s.health
             .iter()
             .map(|(backend, error)| format!("{backend}: {error}")),
     );
-    lines.dedup();
     markup(&lines.join("\n"))
+}
+fn tooltip(s: &Status) -> String {
+    let title = markup(&heading(s));
+    let details = tooltip_details(s);
+    if details.is_empty() {
+        title
+    } else {
+        format!("{title}\n{details}")
+    }
 }
 fn waybar(s: &Status) -> serde_json::Value {
     let (icon, class) = if s.caffeine.is_some() {
