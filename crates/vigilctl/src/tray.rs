@@ -14,7 +14,7 @@ struct Indicator {
     commands: mpsc::Sender<Request>,
 }
 impl Indicator {
-    fn disabled(&self) -> bool {
+    fn keep_awake(&self) -> bool {
         self.status.as_ref().is_some_and(|s| s.caffeine.is_some())
     }
     fn available(&self) -> bool {
@@ -32,11 +32,7 @@ impl Indicator {
         let Some(status) = &self.status else {
             return "Vigil — Unavailable".into();
         };
-        let state = crate::label(status);
-        format!(
-            "Vigil — {state}{}",
-            if status.dry_run { " (dry-run)" } else { "" }
-        )
+        crate::heading(status)
     }
 }
 impl ksni::Tray for Indicator {
@@ -51,7 +47,7 @@ impl ksni::Tray for Indicator {
     }
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
         icons(
-            self.disabled()
+            self.keep_awake()
                 || self
                     .status
                     .as_ref()
@@ -75,7 +71,7 @@ impl ksni::Tray for Indicator {
         let mut menu = vec![
             CheckmarkItem {
                 label: "Keep awake".into(),
-                checked: self.disabled(),
+                checked: self.keep_awake(),
                 enabled: self.available(),
                 activate: Box::new(|tray: &mut Self| tray.send(Request::Toggle)),
                 ..Default::default()
@@ -216,7 +212,7 @@ mod tests {
         tray.activate(0, 0);
         assert!(matches!(received.recv().await, Some(Request::Toggle)));
         assert!(tray.pending);
-        assert!(!tray.disabled());
+        assert!(!tray.keep_awake());
         tray.pending = false;
         let menu = tray.menu();
         assert!(

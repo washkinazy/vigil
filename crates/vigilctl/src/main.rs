@@ -41,6 +41,13 @@ fn label(s: &Status) -> String {
         "Automatic".into()
     }
 }
+fn heading(s: &Status) -> String {
+    format!(
+        "Vigil — {}{}",
+        label(s),
+        if s.dry_run { " (dry-run)" } else { "" }
+    )
+}
 fn tooltip_details(s: &Status) -> String {
     let title_reason = s.caffeine.is_none().then(|| s.inhibitors.first()).flatten();
     let mut lines = Vec::new();
@@ -61,11 +68,7 @@ fn tooltip_details(s: &Status) -> String {
     markup(&lines.join("\n"))
 }
 fn tooltip(s: &Status) -> String {
-    let title = markup(&format!(
-        "Vigil — {}{}",
-        label(s),
-        if s.dry_run { " (dry-run)" } else { "" }
-    ));
+    let title = markup(&heading(s));
     let details = tooltip_details(s);
     if details.is_empty() {
         title
