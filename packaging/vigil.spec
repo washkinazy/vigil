@@ -2,7 +2,7 @@
 
 Name:           vigil
 # x-release-please-start-version
-Version:        0.5.1
+Version:        0.6.0
 # x-release-please-end
 Release:        1%{?dist}
 Summary:        Session idle manager for Wayland

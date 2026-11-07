@@ -716,7 +716,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-core"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -725,7 +725,7 @@ dependencies = [
 
 [[package]]
 name = "vigilctl"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "ksni",
  "serde_json",
@@ -735,7 +735,7 @@ dependencies = [
 
 [[package]]
 name = "vigild"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "futures-util",
  "serde",

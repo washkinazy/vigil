@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.6.0](https://github.com/washkinazy/vigil/compare/v0.5.1...v0.6.0) (2026-11-07)
+
+
+### ⚠ BREAKING CHANGES
+
+* simplify caffeine controls and harden idle inhibition ([#15](https://github.com/washkinazy/vigil/issues/15))
+
+### Features
+
+* simplify caffeine controls and harden idle inhibition ([#15](https://github.com/washkinazy/vigil/issues/15)) ([160715c](https://github.com/washkinazy/vigil/commit/160715c9ffddf4cca5bdb7ff60bd5f437cf6a32c))
+
 ## [0.5.1](https://github.com/washkinazy/vigil/compare/v0.5.0...v0.5.1) (2026-11-07)
 
 
