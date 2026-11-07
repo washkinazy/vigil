@@ -1,0 +1,39 @@
+name: Check Vigil
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        fedora: ['44', '45']
+    container: registry.fedoraproject.org/fedora:${{ matrix.fedora }}
+    steps:
+      - name: Install build tools
+        run: dnf install -y git rust cargo rustfmt clippy gcc just rpm-build systemd-rpm-macros tar gzip shellcheck dbus-daemon
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - run: cargo fetch --locked
+      - run: just check
+      - run: cargo test -p vigild --locked --offline -- --ignored
+      - run: shellcheck scripts/*.sh
+      - name: Check package version
+        run: |
+          cargo_version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml)
+          rpm_version=$(rpmspec --query --srpm --qf '%{VERSION}' packaging/vigil.spec)
+          test "$cargo_version" = "$rpm_version"
+      - name: Build and test RPM from this checkout
+        run: |
+          mkdir -p "$RUNNER_TEMP/rpmbuild/SOURCES"
+          git archive --format=tar.gz --prefix=vigil-main/ HEAD > "$RUNNER_TEMP/rpmbuild/SOURCES/vigil-main.tar.gz"
+          rpmbuild -ba --define "_topdir $RUNNER_TEMP/rpmbuild" packaging/vigil.spec
