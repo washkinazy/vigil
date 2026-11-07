@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/washkinazy/vigil/compare/v0.3.0...v0.3.1) (2026-11-07)
+
+
+### Bug Fixes
+
+* simplify Waybar status tooltip ([#7](https://github.com/washkinazy/vigil/issues/7)) ([3b29975](https://github.com/washkinazy/vigil/commit/3b29975d1fb4e282c0ab7c7187fea9b4633603a9))
+
 ## [0.3.0](https://github.com/washkinazy/vigil/compare/v0.2.0...v0.3.0) (2026-11-07)
 
 
