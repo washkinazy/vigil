@@ -671,7 +671,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -680,7 +680,7 @@ dependencies = [
 
 [[package]]
 name = "vigilctl"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "serde_json",
  "tokio",
@@ -689,7 +689,7 @@ dependencies = [
 
 [[package]]
 name = "vigild"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "futures-util",
  "serde",
