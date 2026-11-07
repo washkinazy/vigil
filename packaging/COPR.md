@@ -19,7 +19,7 @@ does not republish or increment it on installation.
 1. In GitHub **Settings → Secrets and variables → Actions**, add:
    - `RELEASE_PLEASE_TOKEN`: a fine-grained GitHub PAT restricted to this repo,
      with **Contents**, **Pull requests**, and **Issues** read/write permissions.
-     This lets release PRs run normal CI; the built-in `GITHUB_TOKEN` suppresses
+     This lets release PRs run validation; the built-in `GITHUB_TOKEN` suppresses
      workflows triggered by its own changes. Approve the token if required by
      the repository owner/organization.
    - `COPR_CONFIG`: the complete INI configuration from the
@@ -30,7 +30,13 @@ does not republish or increment it on installation.
    Disable **Auto-rebuild** on the `vigil` package. Disable/remove the old COPR
    push webhook in GitHub if one was added. Actions now submits releases directly.
 3. Merge the automation PR. Use squash merges with Conventional Commit titles,
-   and require the normal CI and release-config checks before merging release PRs.
+   and require the CI checks before merging PRs. Generated release PRs run version
+   and release-config validation; their Fedora matrix is skipped only when the
+   diff contains release metadata alone. CI-only and documentation-only PRs also
+   skip the Fedora matrix. Rust, dependency, packaging, build/install script, and
+   unrecognized changes run the full matrix. Workflow validation and CI-selection
+   tests run on every PR, alongside release validation.
+   Checks run on PRs and manual dispatch, not again on pushes to `main`.
 
 No per-release changes to COPR's Committish or spec settings are required.
 The submission passes all source settings each time:
