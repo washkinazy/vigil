@@ -59,13 +59,14 @@ jobs:
     container: registry.fedoraproject.org/fedora:${{ matrix.fedora }}
     steps:
       - name: Install build tools
-        run: dnf install -y git rust cargo rustfmt clippy gcc just rpm-build systemd-rpm-macros tar gzip shellcheck dbus-daemon
+        run: dnf install -y git rust cargo rustfmt clippy gcc just rpm-build systemd-rpm-macros tar gzip shellcheck dbus-daemon systemd
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
       - run: cargo fetch --locked
       - run: just check
       - run: cargo test -p vigild --locked --offline -- --ignored
+      - run: python3 scripts/tray-smoke.py
       - run: shellcheck scripts/*.sh
       - name: Check package version
         run: python3 scripts/check-version.py

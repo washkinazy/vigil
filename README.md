@@ -109,6 +109,34 @@ cannot perform cleanup. Only enable this when no other session component owns
 IdleHint: it may activate logind's configured `IdleAction` independently of
 Vigil's own suspend timer. Dry-run never writes IdleHint.
 
+## Tray indicator
+
+Run `vigilctl tray` or start `vigil-tray.service` with the user systemd manager.
+For Niri startup:
+
+```kdl
+spawn-at-startup "systemctl" "--user" "start" "vigil-tray.service"
+```
+
+The tray service starts Vigil if needed. It requires a StatusNotifierItem host,
+such as Waybar's `tray` module. The indicator uses native D-Bus menus and embedded
+icons; no GTK or icon-font dependency is required.
+
+Left-click toggles automatic idle handling. Right-click provides **Enabled** and
+**Disable for → 30 / 60 / 90 minutes**. Enabled reflects the shared manual toggle;
+application inhibitors and separate keep-awake requests still apply. A new timed
+selection replaces the toggle's previous deadline, and expiry restores Enabled.
+Enabling removes only that override. Explicit lock/suspend commands still work.
+
+The indicator follows daemon status every two seconds and after each action.
+Unavailable daemon connections show a warning and disable menu actions until
+reconnection. It exits after executable replacement; the tray service restarts
+it with the installed version. Stopping the indicator does not clear an override.
+The service is packaged but is not automatically started or enabled.
+
+Waybar users can remove `custom/vigil` and keep the standard `tray` module.
+The optional `vigilctl waybar` integration remains supported.
+
 ## Controls and Waybar
 
 ```sh

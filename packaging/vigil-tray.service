@@ -1,0 +1,13 @@
+[Unit]
+Description=Vigil tray indicator
+PartOf=graphical-session.target
+Wants=vigil.service
+After=graphical-session.target vigil.service
+ConditionEnvironment=WAYLAND_DISPLAY
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/vigilctl tray
+Restart=always
+RestartSec=3
+Slice=session.slice

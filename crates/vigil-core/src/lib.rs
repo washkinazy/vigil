@@ -297,12 +297,18 @@ struct SavedManual {
 impl ManualSnapshot {
     /// Existing IDs retain their original absolute expiry, regardless of clock adjustments.
     pub fn preserve_expirations(&mut self, previous: &Self) {
+        self.preserve_expirations_except(previous, None);
+    }
+    pub fn preserve_expirations_except(&mut self, previous: &Self, renewed: Option<&str>) {
         let deadlines: BTreeMap<_, _> = previous
             .entries
             .iter()
             .map(|m| (&m.id, m.expires_at))
             .collect();
         for entry in &mut self.entries {
+            if renewed == Some(entry.id.as_str()) {
+                continue;
+            }
             if let Some(expiry) = deadlines.get(&entry.id) {
                 entry.expires_at = *expiry;
             }
@@ -354,8 +360,7 @@ impl ManualInhibitors {
                 || saved.reason.trim().is_empty()
                 || saved.reason.len() > 256
                 || saved.reason.chars().any(char::is_control)
-                || (saved.id == "manual:toggle"
-                    && (saved.expires_at.is_some() || saved.scope != ACTIONS))
+                || (saved.id == "manual:toggle" && (saved.scope != ACTIONS))
             {
                 return Err("invalid saved manual inhibitor".into());
             }
@@ -415,6 +420,19 @@ impl ManualInhibitors {
     pub fn clear(&mut self) {
         self.entries.clear();
     }
+    pub fn set_toggle(&mut self, now: u64, seconds: Option<u64>) -> Result<(), String> {
+        if seconds == Some(0) {
+            return Err("duration must be positive".into());
+        }
+        let until = seconds
+            .map(|n| now.checked_add(n).ok_or("duration is too large"))
+            .transpose()?;
+        self.entries.insert(
+            "manual:toggle".into(),
+            (until, "Manual keep-awake (toggle)".into(), ACTIONS.to_vec()),
+        );
+        Ok(())
+    }
     pub fn toggle(&mut self) -> bool {
         if self.entries.remove("manual:toggle").is_some() {
             false
@@ -458,6 +476,9 @@ pub enum Request {
     },
     Automatic,
     Toggle,
+    SetToggle {
+        seconds: Option<u64>,
+    },
     Reload,
     Lock,
     Suspend,

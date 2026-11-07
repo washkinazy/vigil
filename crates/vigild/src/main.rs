@@ -372,9 +372,11 @@ impl Runtime {
         }
     }
     async fn control(&mut self, request: Request, now: u64) -> Result<String, String> {
+        let renewed = matches!(request, Request::SetToggle { .. }).then_some("manual:toggle");
         let changes_manual = matches!(
             request,
             Request::Toggle
+                | Request::SetToggle { .. }
                 | Request::KeepAwake { .. }
                 | Request::Release { .. }
                 | Request::Automatic
@@ -385,7 +387,11 @@ impl Runtime {
             && result.is_ok()
         {
             if let Some(store) = &self.manual_store
-                && let Err(error) = store.save(&self.manual, now)
+                && let Err(error) = if renewed.is_some() {
+                    store.save_renewed(&self.manual, now, renewed)
+                } else {
+                    store.save(&self.manual, now)
+                }
             {
                 self.manual = previous;
                 self.health.insert("manual-state".into(), error.clone());
@@ -478,7 +484,12 @@ impl Runtime {
                 self.config_tx.send_replace((self.revision, self.c.clone()));
                 Ok("Configuration reloaded; idle timers reset, manual inhibitors preserved".into())
             }
+            Request::SetToggle { seconds } => {
+                self.manual.set_toggle(now, seconds)?;
+                Ok("Manual keep-awake enabled".into())
+            }
             Request::Toggle => {
+                self.manual.expire(now);
                 if self.manual.toggle() {
                     Ok("Toggle keep-awake enabled (manual:toggle)".into())
                 } else {
@@ -728,6 +739,85 @@ mod tests {
                 .unwrap()
                 .status(0)
                 .is_empty()
+        );
+        drop(r);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn timed_toggle_replaces_deadline_persists_and_preserves_other_requests() {
+        let dir = std::env::temp_dir().join(format!("vigil-timed-toggle-{}", std::process::id()));
+        let mut r = runtime();
+        r.manual_store = Some(manual_store::Store::open(dir.join("manual.json")).unwrap());
+        r.control(
+            Request::KeepAwake {
+                seconds: None,
+                scope: vec![Action::Suspend],
+                reason: "Download".into(),
+            },
+            0,
+        )
+        .await
+        .unwrap();
+        r.control(
+            Request::SetToggle {
+                seconds: Some(1800),
+            },
+            0,
+        )
+        .await
+        .unwrap();
+        let restored = r.manual_store.as_ref().unwrap().load(0).unwrap();
+        assert!(
+            restored
+                .status(0)
+                .iter()
+                .find(|m| m.id == "manual:toggle")
+                .unwrap()
+                .remaining_seconds
+                .unwrap()
+                <= 1800
+        );
+        r.control(
+            Request::SetToggle {
+                seconds: Some(5400),
+            },
+            10,
+        )
+        .await
+        .unwrap();
+        let restored = r.manual_store.as_ref().unwrap().load(10).unwrap();
+        assert!(
+            restored
+                .status(10)
+                .iter()
+                .find(|m| m.id == "manual:toggle")
+                .unwrap()
+                .remaining_seconds
+                .unwrap()
+                > 5300
+        );
+        assert_eq!(restored.status(10).len(), 2);
+        assert!(
+            r.control(Request::SetToggle { seconds: Some(0) }, 10)
+                .await
+                .is_err()
+        );
+        r.control(Request::Toggle, 11).await.unwrap();
+        assert_eq!(r.status(11).manual_inhibitors.len(), 1);
+        assert_eq!(r.status(11).manual_inhibitors[0].reason, "Download");
+        r.control(Request::SetToggle { seconds: Some(1) }, 12)
+            .await
+            .unwrap();
+        assert_eq!(r.status(13).manual_inhibitors.len(), 1);
+        r.control(Request::SetToggle { seconds: Some(1) }, 14)
+            .await
+            .unwrap();
+        r.control(Request::Toggle, 15).await.unwrap();
+        assert!(
+            r.status(15)
+                .manual_inhibitors
+                .iter()
+                .any(|m| m.id == "manual:toggle" && m.remaining_seconds.is_none())
         );
         drop(r);
         std::fs::remove_dir_all(dir).unwrap();

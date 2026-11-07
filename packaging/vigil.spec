@@ -20,7 +20,7 @@ Requires:       niri
 
 %description
 Vigil coordinates idle timers, activity inhibition, display power, locking,
-and sleep for Wayland sessions. Includes vigild and the vigilctl control client.
+and sleep for Wayland sessions. Includes vigild, vigilctl, and a tray indicator.
 
 %prep
 %autosetup
@@ -35,16 +35,17 @@ cargo test --workspace --release --locked --offline
 install -Dm755 target/release/vigild %{buildroot}%{_bindir}/vigild
 install -Dm755 target/release/vigilctl %{buildroot}%{_bindir}/vigilctl
 install -Dm644 packaging/vigil.service %{buildroot}%{_userunitdir}/vigil.service
-sed -i 's|%%h/.local/bin/|%{_bindir}/|g' %{buildroot}%{_userunitdir}/vigil.service
+install -Dm644 packaging/vigil-tray.service %{buildroot}%{_userunitdir}/vigil-tray.service
+sed -i 's|%%h/.local/bin/|%{_bindir}/|g' %{buildroot}%{_userunitdir}/vigil*.service
 
 %post
-%systemd_user_post vigil.service
+%systemd_user_post vigil.service vigil-tray.service
 
 %preun
-%systemd_user_preun vigil.service
+%systemd_user_preun vigil.service vigil-tray.service
 
 %postun
-%systemd_user_postun vigil.service
+%systemd_user_postun vigil.service vigil-tray.service
 
 %files
 %license LICENSE
@@ -52,6 +53,7 @@ sed -i 's|%%h/.local/bin/|%{_bindir}/|g' %{buildroot}%{_userunitdir}/vigil.servi
 %{_bindir}/vigild
 %{_bindir}/vigilctl
 %{_userunitdir}/vigil.service
+%{_userunitdir}/vigil-tray.service
 
 %changelog
 * Fri Nov 06 2026 Washkinazy <noreply@github.com> - 0.1.0-1
