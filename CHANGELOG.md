@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/washkinazy/vigil/compare/v0.5.0...v0.5.1) (2026-11-07)
+
+
+### Bug Fixes
+
+* flatten tray menu and improve status icons ([#13](https://github.com/washkinazy/vigil/issues/13)) ([3f10e4d](https://github.com/washkinazy/vigil/commit/3f10e4d8e08ad220c61caa1415169f62a4571d9d))
+
 ## [0.5.0](https://github.com/washkinazy/vigil/compare/v0.4.0...v0.5.0) (2026-11-07)
 
 
