@@ -1,5 +1,7 @@
 mod actions;
+mod idle_hint;
 mod logind;
+mod observers;
 mod sensors;
 mod wayland;
 use std::{
@@ -17,6 +19,7 @@ use tokio::{
 use vigil_core::{ACTIONS, Action, Config, Inhibitor, Policy, Request, Response, Status};
 
 pub enum Event {
+    IdleHint(Option<bool>),
     InputIdle(bool),
     EffectiveIdle(bool),
     Health(String, Option<String>),
@@ -41,6 +44,8 @@ struct Runtime {
     blanked: bool,
     manual: Option<(Option<u64>, Vec<Action>)>,
     last_action: Option<String>,
+    idle_hint: Option<bool>,
+    idle_hint_tx: watch::Sender<Option<bool>>,
 }
 impl Runtime {
     fn inhibitors(&mut self, now: u64) -> Vec<Inhibitor> {
@@ -82,6 +87,7 @@ impl Runtime {
         let mut health = self.health.clone();
         health.extend(self.sensor_health.clone());
         Status {
+            idle_hint: self.idle_hint,
             dry_run: self.dry,
             idle_seconds: self.policy.elapsed(now),
             inhibitors,
@@ -275,6 +281,8 @@ async fn start() -> Result<(), String> {
     serve(path.clone(), tx.clone()).await?;
     let clock = Instant::now();
     let (config_tx, config_rx) = watch::channel((0, c.clone()));
+    let (idle_hint_tx, idle_hint_rx) = watch::channel(None);
+    let idle_hint_task = idle_hint::start(tx.clone(), idle_hint_rx, dry);
     let mut r = Runtime {
         c: c.clone(),
         config_file,
@@ -295,53 +303,12 @@ async fn start() -> Result<(), String> {
         blanked: false,
         manual: None,
         last_action: None,
+        idle_hint: None,
+        idle_hint_tx,
     };
     wayland::start(tx.clone());
     logind::start(tx.clone(), config_rx.clone(), dry);
-    let sensor_tx = tx.clone();
-    let mut config_rx = config_rx;
-    tokio::spawn(async move {
-        let mut bus = None;
-        loop {
-            let (revision, config) = config_rx.borrow_and_update().clone();
-            let activity = config.activity;
-            let gathered = tokio::select! {
-                result = sensors::gather(&activity) => result,
-                _ = config_rx.changed() => continue,
-            };
-            let (mut list, mut health) = gathered;
-            if bus.is_none() {
-                bus = zbus::Connection::system().await.ok();
-            }
-            if let Some(conn) = &bus {
-                match timeout(Duration::from_secs(3), logind::inhibitors(conn)).await {
-                    Ok(Ok(found)) => list.extend(found),
-                    _ => {
-                        health.insert(
-                            "external-inhibitors".into(),
-                            "Cannot read logind inhibitors".into(),
-                        );
-                        bus = None;
-                    }
-                }
-            } else {
-                health.insert(
-                    "external-inhibitors".into(),
-                    "System bus unavailable".into(),
-                );
-            }
-            if sensor_tx
-                .send(Event::Sensors(revision, list, health))
-                .is_err()
-            {
-                break;
-            }
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(activity.poll_seconds)) => {},
-                _ = config_rx.changed() => {},
-            }
-        }
-    });
+    observers::start(tx.clone(), config_rx);
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| e.to_string())?;
@@ -365,6 +332,8 @@ async fn start() -> Result<(), String> {
     if r.blanked {
         let _ = r.wake().await;
     }
+    drop(r.idle_hint_tx);
+    let _ = idle_hint_task.await;
     let _ = std::fs::remove_file(path);
     Ok(())
 }
@@ -443,6 +412,7 @@ impl Runtime {
     }
     async fn event(&mut self, event: Event, now: u64) {
         match event {
+            Event::IdleHint(value) => self.idle_hint = value,
             Event::InputIdle(idle) => {
                 self.input(idle, now);
                 if !idle && self.blanked {
@@ -487,11 +457,33 @@ impl Runtime {
             }
         }
     }
+    fn update_idle_hint(&mut self, now: u64) {
+        let inhibited = !self.inhibitors(now).is_empty();
+        let observed = self.input_idle
+            && !self.sleeping
+            && !self.health.contains_key("wayland")
+            && !self.health.contains_key("sensors")
+            && !self.health.contains_key("logind")
+            && self.sensor_health.is_empty();
+        let next = self
+            .c
+            .session
+            .idle_hint(self.policy.elapsed(now), observed, inhibited);
+        self.idle_hint_tx.send_if_modified(|value| {
+            if *value == next {
+                false
+            } else {
+                *value = next;
+                true
+            }
+        });
+    }
     async fn tick(&mut self, now: u64) {
         // Resumed means input is still active until the next one-second idle event.
         if !self.input_idle {
             self.policy.activity(now);
         }
+        self.update_idle_hint(now);
         let status = self.status(now);
         if self.sleeping {
             return;
@@ -542,6 +534,8 @@ mod tests {
             blanked: false,
             manual: None,
             last_action: None,
+            idle_hint: None,
+            idle_hint_tx: watch::channel(None).0,
         }
     }
     #[tokio::test]

@@ -3,6 +3,7 @@ name = "vigild"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 description = "Session idle manager daemon"
 
 [dependencies]

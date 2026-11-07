@@ -200,6 +200,7 @@ mod tests {
     #[test]
     fn tooltip_escapes_external_labels() {
         let s = Status {
+            idle_hint: None,
             dry_run: false,
             idle_seconds: 0,
             inhibitors: vec![vigil_core::Inhibitor {

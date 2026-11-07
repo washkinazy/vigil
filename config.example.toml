@@ -6,6 +6,7 @@ release_grace_seconds = 60
 retry_seconds = 30
 
 [activity]
+# Reconcile logind inhibitors and Niri output geometry; activity uses event streams.
 poll_seconds = 2
 audio = true
 recording = true
@@ -23,3 +24,7 @@ lock_timeout_seconds = 10
 display_off = ["niri", "msg", "action", "power-off-monitors"]
 display_on = ["niri", "msg", "action", "power-on-monitors"]
 suspend = ["systemctl", "suspend"]
+
+[session]
+# Opt in only when Vigil should own logind IdleHint (may activate logind IdleAction).
+idle_hint_seconds = 0

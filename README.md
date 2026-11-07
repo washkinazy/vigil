@@ -2,8 +2,8 @@
 
 Vigil is a Rust session idle manager for Niri on Linux. It owns idle timers,
 activity inhibitors, display power, locking, sleep coordination, and a local
-control socket. Configuration is TOML. It replaces swayidle and a separate audio
-idle inhibitor in the tested Fedora/Niri session.
+control socket. Configuration is TOML. It combines idle scheduling and activity
+inhibition in one daemon.
 
 ## Behavior
 
@@ -49,10 +49,10 @@ signals invoke the locker; Unlock signals never bypass locker authentication.
 
 - Linux, systemd/logind, a user systemd manager, and a Wayland compositor exposing
   ext-idle-notify version 2. Niri is the tested compositor.
-- `pw-dump` (PipeWire tools), `playerctl`, and `niri` for enabled adapters.
+- `pw-dump` (PipeWire tools) and `niri` for enabled adapters; MPRIS uses D-Bus directly.
 - A working Type=notify locker unit and permission to suspend through logind.
 - Rust with edition 2024 support, Cargo, `just`; rustfmt and Clippy for development.
-  Tested with Fedora Rust 1.99.1. No desktop C development libraries are required.
+  No desktop C development libraries are required.
 
 ## Build and install
 
@@ -91,6 +91,24 @@ restores blanked displays using the previous command, and refreshes sensor polic
 Automatic actions wait for a fresh observation; stale pre-reload observations are
 discarded. Sleep preparation uses the latest validated locker settings.
 
+## Activity observation and session idle state
+
+PipeWire activity uses one persistent `pw-dump --monitor` process. MPRIS uses
+D-Bus player lifecycle and property-change signals. Optional fullscreen geometry
+uses Niri's socket event stream. Subscriptions rebuild their state after a
+backend disconnect or configuration reload; old-generation observations are
+ignored. Window titles are discarded before storing Niri state.
+
+Logind IdleHint export is disabled by default. Set `session.idle_hint_seconds`
+to a positive threshold to let Vigil own it. The hint becomes true only after
+observed inactivity with no inhibitors or degraded observation backends. Input,
+resume, inhibition, disabling export, and orderly shutdown clear the hint.
+`vigilctl status --json` exposes the last successfully exported `idle_hint`;
+`null` means disabled, unavailable, or dry-run. An abrupt process termination
+cannot perform cleanup. Only enable this when no other session component owns
+IdleHint: it may activate logind's configured `IdleAction` independently of
+Vigil's own suspend timer. Dry-run never writes IdleHint.
+
 ## Controls and Waybar
 
 ```sh
@@ -108,8 +126,8 @@ vigilctl wake
 vigilctl waybar --watch
 ```
 
-The Waybar output is newline-delimited JSON with escaped tooltips containing the
-a compact list of activity reasons. Duplicate media sources are combined; detailed
+The Waybar output is newline-delimited JSON with escaped tooltips containing a
+compact list of activity reasons. Duplicate media sources are combined; detailed
 scopes, backend warnings, and timers remain available through `vigilctl status`. Example:
 
 ```json
@@ -155,12 +173,13 @@ muted/dummy streams, fullscreen visibility, command timeouts, and lock-before-sl
 ordering. Live lock/suspend testing is intentionally separate from unit/dry-run
 validation because it interrupts the desktop.
 
-## Limits and next steps
+## Limits
 
-- PipeWire, MPRIS, and optional Niri geometry use snapshots every two seconds by
-  default (plus collection time). This starts short-lived CLI processes; native
-  event subscriptions are a future optimization. A running pipeline can carry
-  silence; Vigil does not sample sound to determine audibility.
+- PipeWire stream state cannot establish audibility: a running pipeline can carry
+  silence. Vigil does not sample sound.
+- Logind inhibitors and Niri output geometry are reconciled every two seconds by
+  default, controlled by `activity.poll_seconds`. These use D-Bus/socket requests;
+  they do not launch polling subprocesses.
 - MPRIS does not reliably distinguish video from music. Any player reporting
   Playing blocks the configured media scope, even if its audio is muted.
 - Niri currently lacks an authoritative fullscreen field in window IPC.
@@ -173,13 +192,13 @@ validation because it interrupts the desktop.
   Missing MPRIS/fullscreen/logind observations cannot reconstruct unknown activity.
 - Manual overrides are process-local. Only one manual override exists; a new one
   replaces it. `toggle` runs atomically in the daemon, including concurrent clients.
-- Optional Redshift automation is not implemented. It needs state-aware ownership
-  and restoration so automation cannot undo a later manual decision.
-- This implements the core idle lifecycle, not swayidle's shell-command language,
-  arbitrary timeout hooks, or every compositor-specific feature. IdleHint export,
-  and additional compositor adapters are not implemented.
+- Night-color control belongs to the desktop's Redshift/Gammastep configuration;
+  Vigil does not change it.
+- Niri is the supported compositor. Other compositors need compatible idle
+  protocols and their own display commands; fullscreen observation is Niri-only.
+  Vigil does not implement swayidle's shell-command language or arbitrary hooks.
 
 `vigil-core` contains deterministic policy and TOML types; `vigild` owns I/O and
 policy execution; `vigilctl` renders the daemon's decisions. Host package selection
 belongs in the Fedora setup repository; user preferences/startup belong in chezmoi.
-No license has been selected yet.
+Licensed under the [MIT license](LICENSE).

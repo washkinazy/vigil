@@ -17,6 +17,19 @@ pub struct Config {
     pub timeouts: Timeouts,
     pub activity: ActivityConfig,
     pub commands: Commands,
+    pub session: SessionConfig,
+}
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionConfig {
+    /// Zero disables logind IdleHint export.
+    pub idle_hint_seconds: u64,
+}
+impl SessionConfig {
+    pub fn idle_hint(&self, elapsed: u64, observed: bool, inhibited: bool) -> Option<bool> {
+        (self.idle_hint_seconds > 0)
+            .then_some(observed && !inhibited && elapsed >= self.idle_hint_seconds)
+    }
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -251,6 +264,7 @@ pub enum Request {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Status {
+    pub idle_hint: Option<bool>,
     pub dry_run: bool,
     pub idle_seconds: u64,
     pub inhibitors: Vec<Inhibitor>,
@@ -350,5 +364,21 @@ mod tests {
         assert_eq!(duration("2h"), Ok(7200));
         assert!(duration("0").is_err());
         assert!(duration("18446744073709551615d").is_err());
+    }
+}
+
+#[cfg(test)]
+mod idle_hint_tests {
+    use super::*;
+    #[test]
+    fn opt_in_hint_requires_observed_uninhibited_idle() {
+        let mut c = SessionConfig::default();
+        assert_eq!(c.idle_hint(1000, true, false), None);
+        c.idle_hint_seconds = 60;
+        assert_eq!(c.idle_hint(59, true, false), Some(false));
+        assert_eq!(c.idle_hint(60, true, false), Some(true));
+        assert_eq!(c.idle_hint(60, false, false), Some(false));
+        assert_eq!(c.idle_hint(60, true, true), Some(false));
+        assert_eq!(c.idle_hint(0, true, false), Some(false));
     }
 }

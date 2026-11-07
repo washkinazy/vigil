@@ -1,7 +1,6 @@
-use crate::actions;
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
-use vigil_core::{ACTIONS, Action, ActivityConfig, Fullscreen, Inhibitor};
+use std::collections::BTreeSet;
+use vigil_core::{ACTIONS, ActivityConfig, Inhibitor};
 
 pub fn audio(objects: &Value, c: &ActivityConfig) -> Vec<Inhibitor> {
     let Some(objects) = objects.as_array() else {
@@ -114,76 +113,6 @@ pub fn fullscreen(windows: &Value, workspaces: &Value, outputs: &Value) -> Vec<I
         }
     }
     result
-}
-async fn json(args: &[&str]) -> Result<Value, String> {
-    serde_json::from_str(&actions::run(args, 3).await?).map_err(|e| e.to_string())
-}
-pub async fn gather(c: &ActivityConfig) -> (Vec<Inhibitor>, BTreeMap<String, String>) {
-    let mut all = Vec::new();
-    let mut health = BTreeMap::new();
-    if c.audio || c.recording {
-        match json(&["pw-dump"]).await {
-            Ok(v) => all.extend(audio(&v, c)),
-            Err(e) => {
-                health.insert("pipewire".into(), e);
-                all.push(Inhibitor {
-                    id: "degraded:pipewire".into(),
-                    reason: "Audio state unavailable".into(),
-                    scope: vec![Action::Suspend],
-                });
-            }
-        }
-    }
-    if c.media {
-        match actions::run(
-            &[
-                "playerctl",
-                "--all-players",
-                "--format",
-                "{{playerName}}\t{{status}}",
-                "metadata",
-            ],
-            3,
-        )
-        .await
-        {
-            Ok(lines) => {
-                for line in lines.lines() {
-                    if let Some((name, "Playing")) = line.split_once('\t') {
-                        all.push(Inhibitor {
-                            id: format!("mpris:{name}"),
-                            reason: format!("Media playing: {name}"),
-                            scope: c.media_scope.clone(),
-                        });
-                    }
-                }
-            }
-            Err(e) if e.contains("No players found") => {}
-            Err(e) => {
-                health.insert("mpris".into(), e);
-            }
-        }
-    }
-    if c.fullscreen == Fullscreen::Geometry {
-        let (w, s, o) = tokio::join!(
-            json(&["niri", "msg", "--json", "windows"]),
-            json(&["niri", "msg", "--json", "workspaces"]),
-            json(&["niri", "msg", "--json", "outputs"])
-        );
-        match (w, s, o) {
-            (Ok(w), Ok(s), Ok(o)) => {
-                all.extend(fullscreen(&w, &s, &o));
-                health.insert(
-                    "fullscreen".into(),
-                    "Geometry approximation enabled; no authoritative fullscreen flag".into(),
-                );
-            }
-            _ => {
-                health.insert("fullscreen".into(), "Niri state unavailable".into());
-            }
-        }
-    }
-    (all, health)
 }
 #[cfg(test)]
 mod tests {
