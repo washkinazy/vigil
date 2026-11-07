@@ -10,6 +10,7 @@ for name in vigild vigilctl; do
     mv -f "$bin_dir/.$name.new" "$bin_dir/$name"
 done
 install -m 644 packaging/vigil.service "$config_dir/systemd/user/vigil.service"
+install -m 644 packaging/vigil-tray.service "$config_dir/systemd/user/vigil-tray.service"
 if [ ! -e "$config_dir/vigil/config.toml" ]; then
     install -m 644 config.example.toml "$config_dir/vigil/config.toml"
 fi

@@ -89,9 +89,17 @@ impl Store {
         Ok(restored)
     }
     pub fn save(&self, manual: &ManualInhibitors, now: u64) -> Result<(), String> {
+        self.save_renewed(manual, now, None)
+    }
+    pub fn save_renewed(
+        &self,
+        manual: &ManualInhibitors,
+        now: u64,
+        renewed: Option<&str>,
+    ) -> Result<(), String> {
         let mut snapshot = manual.snapshot(now, unix_now()?)?;
         if let Some(previous) = self.saved.borrow().as_ref() {
-            snapshot.preserve_expirations(previous);
+            snapshot.preserve_expirations_except(previous, renewed);
         }
         let bytes = serde_json::to_vec(&snapshot).map_err(|e| e.to_string())?;
         if bytes.len() > 1_048_576 {
