@@ -15,9 +15,7 @@ struct Indicator {
 }
 impl Indicator {
     fn disabled(&self) -> bool {
-        self.status
-            .as_ref()
-            .is_some_and(|s| s.manual_inhibitors.iter().any(|m| m.id == "manual:toggle"))
+        self.status.as_ref().is_some_and(|s| s.caffeine.is_some())
     }
     fn available(&self) -> bool {
         self.status.is_some() && !self.pending
@@ -34,17 +32,7 @@ impl Indicator {
         let Some(status) = &self.status else {
             return "Vigil — Unavailable".into();
         };
-        let state = match status
-            .manual_inhibitors
-            .iter()
-            .find(|m| m.id == "manual:toggle")
-        {
-            Some(manual) => manual.remaining_seconds.map_or_else(
-                || "Disabled".into(),
-                |n| format!("Disabled — {} min", n.div_ceil(60)),
-            ),
-            None => "Enabled".into(),
-        };
+        let state = crate::label(status);
         format!(
             "Vigil — {state}{}",
             if status.dry_run { " (dry-run)" } else { "" }
@@ -62,20 +50,31 @@ impl ksni::Tray for Indicator {
         self.send(Request::Toggle);
     }
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
-        icons(self.disabled(), self.status.is_none())
+        icons(
+            self.disabled()
+                || self
+                    .status
+                    .as_ref()
+                    .is_some_and(|s| !s.inhibitors.is_empty()),
+            self.status.is_none(),
+        )
     }
     fn tool_tip(&self) -> ksni::ToolTip {
         ksni::ToolTip {
             title: self.label(),
-            description: self.error.as_deref().map(markup).unwrap_or_default(),
+            description: self
+                .error
+                .as_deref()
+                .map(markup)
+                .unwrap_or_else(|| self.status.as_ref().map(crate::tooltip).unwrap_or_default()),
             ..Default::default()
         }
     }
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         let mut menu = vec![
             CheckmarkItem {
-                label: "Enabled".into(),
-                checked: self.status.is_some() && !self.disabled(),
+                label: "Keep awake".into(),
+                checked: self.disabled(),
                 enabled: self.available(),
                 activate: Box::new(|tray: &mut Self| tray.send(Request::Toggle)),
                 ..Default::default()
@@ -85,10 +84,10 @@ impl ksni::Tray for Indicator {
         ];
         menu.extend([30, 60, 90].into_iter().map(|minutes| {
             StandardItem {
-                label: format!("Disable for {minutes} minutes"),
+                label: format!("Keep awake for {minutes} minutes"),
                 enabled: self.available(),
                 activate: Box::new(move |tray: &mut Self| {
-                    tray.send(Request::SetToggle {
+                    tray.send(Request::KeepAwake {
                         seconds: Some(minutes * 60),
                     })
                 }),
@@ -231,7 +230,7 @@ mod tests {
             };
             (item.activate)(&mut tray);
             assert!(
-                matches!(received.recv().await, Some(Request::SetToggle { seconds: Some(n) }) if n == seconds)
+                matches!(received.recv().await, Some(Request::KeepAwake { seconds: Some(n) }) if n == seconds)
             );
         }
     }
@@ -257,7 +256,7 @@ mod tests {
         }
     }
     #[test]
-    fn unavailable_controls_are_disabled_and_other_inhibitors_leave_enabled_checked() {
+    fn application_pause_is_visible_without_enabling_caffeine() {
         let (mut tray, mut received) = indicator();
         tray.status
             .as_mut()
@@ -268,12 +267,14 @@ mod tests {
                 reason: "Music".into(),
                 scope: vigil_core::ACTIONS.to_vec(),
             });
-        assert_eq!(tray.label(), "Vigil — Enabled");
+        assert_eq!(tray.label(), "Vigil — Paused: Music");
+        assert_eq!(tray.icon_pixmap()[0].data, icons(true, false)[0].data);
+        assert!(tray.tool_tip().description.contains("Music"));
         let menu = tray.menu();
         let ksni::MenuItem::Checkmark(item) = &menu[0] else {
-            panic!("missing Enabled")
+            panic!("missing Keep awake")
         };
-        assert!(item.checked);
+        assert!(!item.checked);
         tray.status = None;
         tray.activate(0, 0);
         assert!(received.try_recv().is_err());

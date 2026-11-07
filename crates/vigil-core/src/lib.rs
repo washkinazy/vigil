@@ -37,7 +37,9 @@ pub struct Timeouts {
     pub display_seconds: u64,
     pub lock_seconds: u64,
     pub suspend_seconds: u64,
-    pub release_grace_seconds: u64,
+    // Accepted for older configurations; release now restarts the ordinary timeout.
+    #[serde(rename = "release_grace_seconds", skip_serializing)]
+    pub legacy_release_grace_seconds: Option<u64>,
     pub retry_seconds: u64,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -51,7 +53,8 @@ pub struct ActivityConfig {
     pub audio_scope: Vec<Action>,
     pub recording_scope: Vec<Action>,
     pub media_scope: Vec<Action>,
-    pub ignore_audio: Vec<String>,
+    #[serde(rename = "ignore_audio", skip_serializing)]
+    _legacy_ignore_audio: Vec<String>,
 }
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -74,7 +77,7 @@ impl Default for Timeouts {
             display_seconds: 900,
             lock_seconds: 1200,
             suspend_seconds: 1800,
-            release_grace_seconds: 60,
+            legacy_release_grace_seconds: None,
             retry_seconds: 30,
         }
     }
@@ -87,10 +90,10 @@ impl Default for ActivityConfig {
             recording: true,
             media: true,
             fullscreen: Fullscreen::Disabled,
-            audio_scope: vec![Action::Suspend],
-            recording_scope: vec![Action::Suspend],
+            audio_scope: ACTIONS.to_vec(),
+            recording_scope: ACTIONS.to_vec(),
             media_scope: ACTIONS.to_vec(),
-            ignore_audio: vec!["speech-dispatcher-dummy".into(), "sd_dummy".into()],
+            _legacy_ignore_audio: vec![],
         }
     }
 }
@@ -128,8 +131,8 @@ impl Config {
         if !(1..=60).contains(&self.commands.lock_timeout_seconds) {
             return Err("commands.lock_timeout_seconds must be 1..60".into());
         }
-        if self.timeouts.retry_seconds == 0 || self.timeouts.release_grace_seconds == 0 {
-            return Err("retry and release grace must be positive".into());
+        if self.timeouts.retry_seconds == 0 {
+            return Err("retry must be positive".into());
         }
         if self.commands.lock_unit.is_empty()
             || self.commands.lock_unit.starts_with('-')
@@ -175,7 +178,6 @@ pub struct Timer {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TimerDelay {
-    ReleaseGrace,
     Retry,
 }
 #[derive(Debug, Clone)]
@@ -228,8 +230,8 @@ impl Policy {
                 let s = self.states.get_mut(&a).expect("all action states exist");
                 let blocked = inhibitors.iter().any(|i| i.scope.contains(&a));
                 if s.blocked && !blocked {
-                    s.not_before = now.saturating_add(c.timeouts.release_grace_seconds);
-                    s.delay = Some(TimerDelay::ReleaseGrace);
+                    s.not_before = now.saturating_add(c.timeout(a));
+                    s.delay = None;
                 }
                 if blocked {
                     s.completed = false;
@@ -266,195 +268,42 @@ impl Policy {
     }
 }
 
-/// Manual inhibitors with deadlines on the daemon's monotonic clock.
+/// A single session-scoped caffeine override, using monotonic deadlines.
 #[derive(Debug, Default, Clone)]
-pub struct ManualInhibitors {
-    next_id: u64,
-    entries: BTreeMap<String, (Option<u64>, String, Vec<Action>)>,
+pub struct Caffeine {
+    until: Option<Option<u64>>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ManualStatus {
-    pub id: String,
-    pub reason: String,
-    pub scope: Vec<Action>,
+pub struct CaffeineStatus {
     pub remaining_seconds: Option<u64>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ManualSnapshot {
-    version: u32,
-    next_id: u64,
-    entries: Vec<SavedManual>,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SavedManual {
-    id: String,
-    reason: String,
-    scope: Vec<Action>,
-    expires_at: Option<u64>,
-}
-impl ManualSnapshot {
-    /// Existing IDs retain their original absolute expiry, regardless of clock adjustments.
-    pub fn preserve_expirations(&mut self, previous: &Self) {
-        self.preserve_expirations_except(previous, None);
-    }
-    pub fn preserve_expirations_except(&mut self, previous: &Self, renewed: Option<&str>) {
-        let deadlines: BTreeMap<_, _> = previous
-            .entries
-            .iter()
-            .map(|m| (&m.id, m.expires_at))
-            .collect();
-        for entry in &mut self.entries {
-            if renewed == Some(entry.id.as_str()) {
-                continue;
-            }
-            if let Some(expiry) = deadlines.get(&entry.id) {
-                entry.expires_at = *expiry;
-            }
-        }
-    }
-}
-impl ManualInhibitors {
-    pub fn snapshot(&self, now: u64, unix_now: u64) -> Result<ManualSnapshot, String> {
-        let entries = self
-            .status(now)
-            .into_iter()
-            .map(|m| {
-                Ok(SavedManual {
-                    id: m.id,
-                    reason: m.reason,
-                    scope: m.scope,
-                    expires_at: m
-                        .remaining_seconds
-                        .map(|n| unix_now.checked_add(n).ok_or("expiration overflow"))
-                        .transpose()?,
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        Ok(ManualSnapshot {
-            version: 1,
-            next_id: self.next_id,
-            entries,
-        })
-    }
-    pub fn restore(snapshot: ManualSnapshot, now: u64, unix_now: u64) -> Result<Self, String> {
-        if snapshot.version != 1 {
-            return Err("unsupported manual state version".into());
-        }
-        let mut result = Self {
-            next_id: snapshot.next_id,
-            entries: BTreeMap::new(),
-        };
-        for saved in snapshot.entries {
-            let valid_id = saved.id == "manual:toggle"
-                || saved
-                    .id
-                    .strip_prefix("manual:")
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .is_some_and(|n| {
-                        n > 0 && n <= result.next_id && saved.id == format!("manual:{n}")
-                    });
-            if !valid_id
-                || saved.scope.is_empty()
-                || saved.reason.trim().is_empty()
-                || saved.reason.len() > 256
-                || saved.reason.chars().any(char::is_control)
-                || (saved.id == "manual:toggle" && (saved.scope != ACTIONS))
-            {
-                return Err("invalid saved manual inhibitor".into());
-            }
-            if result.entries.contains_key(&saved.id) {
-                return Err("duplicate saved manual inhibitor".into());
-            }
-            let until = match saved.expires_at {
-                Some(expiry) if expiry <= unix_now => continue,
-                Some(expiry) => Some(
-                    now.checked_add(expiry - unix_now)
-                        .ok_or("expiration overflow")?,
-                ),
-                None => None,
-            };
-            result
-                .entries
-                .insert(saved.id, (until, saved.reason, saved.scope));
-        }
-        Ok(result)
-    }
-    pub fn expire(&mut self, now: u64) {
-        self.entries
-            .retain(|_, (until, _, _)| until.is_none_or(|until| now < until));
-    }
-    pub fn add(
-        &mut self,
-        now: u64,
-        seconds: Option<u64>,
-        scope: Vec<Action>,
-        reason: String,
-    ) -> Result<String, String> {
-        if scope.is_empty() || seconds == Some(0) {
-            return Err("scope and duration must be nonempty/positive".into());
-        }
-        if reason.trim().is_empty() || reason.len() > 256 || reason.chars().any(char::is_control) {
-            return Err("reason must be 1–256 bytes with no control characters".into());
-        }
-        let until = seconds
-            .map(|s| now.checked_add(s).ok_or("duration is too large"))
-            .transpose()?;
-        let next = self
-            .next_id
-            .checked_add(1)
-            .ok_or("manual inhibitor IDs exhausted")?;
-        self.next_id = next;
-        let id = format!("manual:{next}");
-        self.entries.insert(id.clone(), (until, reason, scope));
-        Ok(id)
-    }
-    pub fn release(&mut self, id: &str, now: u64) -> Result<(), String> {
-        self.expire(now);
-        self.entries
-            .remove(id)
-            .map(|_| ())
-            .ok_or_else(|| format!("No active manual inhibitor: {id}"))
-    }
-    pub fn clear(&mut self) {
-        self.entries.clear();
-    }
-    pub fn set_toggle(&mut self, now: u64, seconds: Option<u64>) -> Result<(), String> {
+impl Caffeine {
+    pub fn set(&mut self, now: u64, seconds: Option<u64>) -> Result<(), String> {
         if seconds == Some(0) {
             return Err("duration must be positive".into());
         }
         let until = seconds
             .map(|n| now.checked_add(n).ok_or("duration is too large"))
             .transpose()?;
-        self.entries.insert(
-            "manual:toggle".into(),
-            (until, "Manual keep-awake (toggle)".into(), ACTIONS.to_vec()),
-        );
+        self.until = Some(until);
         Ok(())
     }
-    pub fn toggle(&mut self) -> bool {
-        if self.entries.remove("manual:toggle").is_some() {
-            false
+    pub fn clear(&mut self) {
+        self.until = None;
+    }
+    pub fn toggle(&mut self, now: u64) {
+        if self.status(now).is_some() {
+            self.clear();
         } else {
-            self.entries.insert(
-                "manual:toggle".into(),
-                (None, "Manual keep-awake (toggle)".into(), ACTIONS.to_vec()),
-            );
-            true
+            self.until = Some(None);
         }
     }
-    pub fn status(&self, now: u64) -> Vec<ManualStatus> {
-        self.entries
-            .iter()
-            .filter(|(_, (until, _, _))| until.is_none_or(|until| now < until))
-            .map(|(id, (until, reason, scope))| ManualStatus {
-                id: id.clone(),
-                reason: reason.clone(),
-                scope: scope.clone(),
-                remaining_seconds: until.map(|until| until.saturating_sub(now)),
+    pub fn status(&self, now: u64) -> Option<CaffeineStatus> {
+        self.until
+            .filter(|until| until.is_none_or(|until| now < until))
+            .map(|until| CaffeineStatus {
+                remaining_seconds: until.map(|until| until - now),
             })
-            .collect()
     }
 }
 
@@ -462,23 +311,10 @@ impl ManualInhibitors {
 #[serde(tag = "command", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Request {
     Status,
-    Explain {
-        action: Action,
-    },
-    KeepAwake {
-        seconds: Option<u64>,
-        scope: Vec<Action>,
-        #[serde(default = "default_manual_reason")]
-        reason: String,
-    },
-    Release {
-        id: String,
-    },
+    Explain { action: Action },
+    KeepAwake { seconds: Option<u64> },
     Automatic,
     Toggle,
-    SetToggle {
-        seconds: Option<u64>,
-    },
     Reload,
     Lock,
     Suspend,
@@ -493,17 +329,13 @@ pub struct Status {
     pub timers: Vec<Timer>,
     pub health: BTreeMap<String, String>,
     pub last_action: Option<String>,
-    pub manual_inhibitors: Vec<ManualStatus>,
+    pub caffeine: Option<CaffeineStatus>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Response {
     pub ok: bool,
     pub message: String,
     pub status: Option<Status>,
-}
-
-fn default_manual_reason() -> String {
-    "Manual keep-awake".into()
 }
 
 pub fn duration(value: &str) -> Result<u64, String> {
@@ -554,16 +386,16 @@ mod tests {
         assert_eq!(p.timers(1002, &c, &[])[0].remaining_seconds, 900);
     }
     #[test]
-    fn overlapping_inhibitors_and_release_grace() {
+    fn overlapping_inhibitors_restart_only_released_timers() {
         let c = Config::default();
         let mut p = Policy::new(0);
         let a = blocker("audio", vec![Action::Suspend]);
         let b = blocker("manual", ACTIONS.to_vec());
         assert!(p.timers(2000, &c, &[a.clone(), b])[2].blocked);
         assert!(p.timers(2001, &c, &[a])[2].blocked);
-        assert_eq!(p.timers(2002, &c, &[])[2].remaining_seconds, 60);
-        assert!(!due(&p.timers(2061, &c, &[])[2]));
-        assert!(due(&p.timers(2062, &c, &[])[2]));
+        assert_eq!(p.timers(2002, &c, &[])[2].remaining_seconds, 1800);
+        assert!(!due(&p.timers(3801, &c, &[])[2]));
+        assert!(due(&p.timers(3802, &c, &[])[2]));
     }
     #[test]
     fn action_scopes_and_failures() {
@@ -610,133 +442,21 @@ mod idle_hint_tests {
 }
 
 #[cfg(test)]
-mod manual_tests {
+mod caffeine_tests {
     use super::*;
     #[test]
-    fn rejects_invalid_requests_without_replacing_existing_state() {
-        let mut m = ManualInhibitors::default();
-        let id = m
-            .add(10, Some(20), vec![Action::Suspend], "Download".into())
-            .unwrap();
-        for reason in [
-            "".to_string(),
-            "  ".into(),
-            "bad\nlabel".into(),
-            "x".repeat(257),
-        ] {
-            assert!(m.add(10, None, ACTIONS.to_vec(), reason).is_err());
-        }
-        assert!(m.add(10, Some(0), ACTIONS.to_vec(), "Zero".into()).is_err());
-        assert!(m.add(10, None, vec![], "Empty".into()).is_err());
-        assert!(
-            m.add(10, Some(u64::MAX), ACTIONS.to_vec(), "Overflow".into())
-                .is_err()
-        );
-        let status = m.status(15);
-        assert_eq!(status.len(), 1);
-        assert_eq!(status[0].id, id);
-        assert_eq!(status[0].remaining_seconds, Some(15));
-        m.expire(30);
-        assert!(m.status(30).is_empty());
-        let next = m.add(30, None, ACTIONS.to_vec(), "Next".into()).unwrap();
-        assert_ne!(next, id);
-    }
-}
-
-#[cfg(test)]
-mod persistence_tests {
-    use super::*;
-    #[test]
-    fn restart_preserves_ids_deadlines_toggle_and_counter() {
-        let mut manual = ManualInhibitors::default();
-        let timed = manual
-            .add(10, Some(60), vec![Action::Suspend], "Backup".into())
-            .unwrap();
-        let indefinite = manual
-            .add(10, None, ACTIONS.to_vec(), "Presentation".into())
-            .unwrap();
-        manual.toggle();
-        let snapshot = manual.snapshot(20, 1000).unwrap();
-        let mut restored = ManualInhibitors::restore(snapshot, 0, 1020).unwrap();
-        let status = restored.status(0);
-        assert_eq!(
-            status
-                .iter()
-                .find(|m| m.id == timed)
-                .unwrap()
-                .remaining_seconds,
-            Some(30)
-        );
-        assert!(status.iter().any(|m| m.id == indefinite));
-        assert!(status.iter().any(|m| m.id == "manual:toggle"));
-        // A second save/restart must not grant another 60 seconds.
-        restored =
-            ManualInhibitors::restore(restored.snapshot(10, 1030).unwrap(), 0, 1040).unwrap();
-        assert_eq!(
-            restored
-                .status(0)
-                .iter()
-                .find(|m| m.id == timed)
-                .unwrap()
-                .remaining_seconds,
-            Some(10)
-        );
-        restored.expire(10);
-        assert!(!restored.status(10).iter().any(|m| m.id == timed));
-        restored.clear();
-        let mut restored =
-            ManualInhibitors::restore(restored.snapshot(10, 1050).unwrap(), 0, 1100).unwrap();
-        assert!(restored.status(0).is_empty());
-        assert_eq!(
-            restored
-                .add(0, None, ACTIONS.to_vec(), "New".into())
-                .unwrap(),
-            "manual:3"
-        );
-    }
-    #[test]
-    fn saving_other_requests_does_not_move_existing_expirations() {
-        let mut manual = ManualInhibitors::default();
-        manual
-            .add(0, Some(100), ACTIONS.to_vec(), "Original".into())
-            .unwrap();
-        let previous = manual.snapshot(0, 1000).unwrap();
-        // Simulate suspend/clock movement before a new request is created.
-        manual
-            .add(10, Some(100), ACTIONS.to_vec(), "New".into())
-            .unwrap();
-        let mut next = manual.snapshot(10, 2000).unwrap();
-        next.preserve_expirations(&previous);
-        assert_eq!(
-            next.entries
-                .iter()
-                .find(|m| m.id == "manual:1")
-                .unwrap()
-                .expires_at,
-            Some(1100)
-        );
-        assert_eq!(
-            next.entries
-                .iter()
-                .find(|m| m.id == "manual:2")
-                .unwrap()
-                .expires_at,
-            Some(2100)
-        );
-    }
-    #[test]
-    fn expired_while_stopped_is_not_restored_and_invalid_state_is_rejected() {
-        let mut manual = ManualInhibitors::default();
-        manual
-            .add(0, Some(10), ACTIONS.to_vec(), "Timed".into())
-            .unwrap();
-        let restored = ManualInhibitors::restore(manual.snapshot(0, 100).unwrap(), 0, 111).unwrap();
-        assert!(restored.status(0).is_empty());
-        let mut snapshot = manual.snapshot(0, 100).unwrap();
-        snapshot.version = 99;
-        assert!(ManualInhibitors::restore(snapshot, 0, 100).is_err());
-        let mut snapshot = manual.snapshot(0, 100).unwrap();
-        snapshot.entries[0].id = "audio:1".into();
-        assert!(ManualInhibitors::restore(snapshot, 0, 100).is_err());
+    fn replaces_deadline_expires_and_rejects_invalid_updates() {
+        let mut c = Caffeine::default();
+        c.set(10, Some(20)).unwrap();
+        assert_eq!(c.status(15).unwrap().remaining_seconds, Some(15));
+        c.set(15, Some(40)).unwrap();
+        assert!(c.set(15, Some(0)).is_err());
+        assert!(c.set(15, Some(u64::MAX)).is_err());
+        assert_eq!(c.status(30).unwrap().remaining_seconds, Some(25));
+        assert!(c.status(55).is_none());
+        c.toggle(55);
+        assert_eq!(c.status(100).unwrap().remaining_seconds, None);
+        c.toggle(100);
+        assert!(c.status(100).is_none());
     }
 }

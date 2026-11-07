@@ -11,7 +11,7 @@ use tokio::{
     task::JoinSet,
     time::{sleep, timeout},
 };
-use vigil_core::{Action, ActivityConfig, Config, Fullscreen, Inhibitor};
+use vigil_core::{ACTIONS, ActivityConfig, Config, Fullscreen, Inhibitor};
 use zbus::{Connection, MatchRule, MessageStream, Proxy, message::Type};
 
 type Update = (&'static str, Vec<Inhibitor>, Option<String>);
@@ -73,7 +73,7 @@ pub fn start(tx: mpsc::UnboundedSender<Event>, mut config: watch::Receiver<(u64,
                                     all.push(Inhibitor {
                                         id: "degraded:pipewire".into(),
                                         reason: "Audio state unavailable".into(),
-                                        scope: vec![Action::Suspend],
+                                        scope: ACTIONS.into_iter().filter(|a| (c.activity.audio && c.activity.audio_scope.contains(a)) || (c.activity.recording && c.activity.recording_scope.contains(a))).collect(),
                                     });
                                 }
                             }
@@ -183,12 +183,16 @@ async fn session_bus() -> Result<Connection, String> {
         .await
         .map_err(|e| e.to_string())
 }
-async fn media_snapshot(bus: &Connection, c: &ActivityConfig) -> Result<Vec<Inhibitor>, String> {
+async fn media_snapshot(
+    bus: &Connection,
+    c: &ActivityConfig,
+) -> Result<(Vec<Inhibitor>, Option<String>), String> {
     let dbus = zbus::fdo::DBusProxy::new(bus)
         .await
         .map_err(|e| e.to_string())?;
     let names = dbus.list_names().await.map_err(|e| e.to_string())?;
     let mut list = Vec::new();
+    let mut errors = Vec::new();
     for name in names {
         let name = name.as_str();
         if !name.starts_with("org.mpris.MediaPlayer2.") {
@@ -212,10 +216,10 @@ async fn media_snapshot(bus: &Connection, c: &ActivityConfig) -> Result<Vec<Inhi
                 scope: c.media_scope.clone(),
             }),
             Ok(_) => {}
-            Err(e) => return Err(format!("{name}: {e}")),
+            Err(e) => errors.push(format!("{name}: {e}")),
         }
     }
-    Ok(list)
+    Ok((list, (!errors.is_empty()).then(|| errors.join("; "))))
 }
 async fn mpris(tx: &Sender, c: &ActivityConfig) -> Result<(), String> {
     mpris_on_bus(tx, c, session_bus().await?).await
@@ -241,7 +245,8 @@ async fn mpris_on_bus(tx: &Sender, c: &ActivityConfig, bus: Connection) -> Resul
         .await
         .map_err(|e| e.to_string())?;
     loop {
-        tx.send(("mpris", media_snapshot(&bus, c).await?, None))
+        let (list, error) = media_snapshot(&bus, c).await?;
+        tx.send(("mpris", list, error))
             .await
             .map_err(|e| e.to_string())?;
         loop {
@@ -471,6 +476,14 @@ mod tests {
             &self.status
         }
     }
+    struct BrokenPlayer;
+    #[zbus::interface(name = "org.mpris.MediaPlayer2.Player")]
+    impl BrokenPlayer {
+        #[zbus(property)]
+        fn playback_status(&self) -> zbus::fdo::Result<String> {
+            Err(zbus::fdo::Error::Failed("player unavailable".into()))
+        }
+    }
     #[tokio::test]
     #[ignore = "requires dbus-daemon and permission to create a private bus socket"]
     async fn mpris_tracks_play_pause_and_player_removal() {
@@ -500,6 +513,15 @@ mod tests {
             .build()
             .await
             .unwrap();
+        let broken = zbus::connection::Builder::address(address)
+            .unwrap()
+            .name("org.mpris.MediaPlayer2.Broken")
+            .unwrap()
+            .serve_at("/org/mpris/MediaPlayer2", BrokenPlayer)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
         let client = zbus::connection::Builder::address(address)
             .unwrap()
             .build()
@@ -514,7 +536,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(error.is_none());
+        assert!(error.unwrap().contains("Broken"));
         assert_eq!(list.len(), 1);
         let player = service
             .object_server()
@@ -554,6 +576,16 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(list.is_empty());
+        broken
+            .release_name("org.mpris.MediaPlayer2.Broken")
+            .await
+            .unwrap();
+        let (_, list, error) = timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(list.is_empty());
+        assert!(error.is_none());
         monitor.abort();
         let _ = monitor.await;
         daemon.kill().await.unwrap();

@@ -44,7 +44,7 @@ pub fn audio(objects: &Value, c: &ActivityConfig) -> Vec<Inhibitor> {
         .any(|k| {
             p[*k]
                 .as_str()
-                .is_some_and(|v| c.ignore_audio.iter().any(|i| i == v))
+                .is_some_and(|v| ["speech-dispatcher-dummy", "sd_dummy"].contains(&v))
         }) {
             continue;
         }
@@ -128,6 +128,36 @@ mod tests {
         assert!(audio(&stream("running", "speech-dispatcher-dummy", false), &c).is_empty());
         assert!(audio(&stream("running", "browser", true), &c).is_empty());
         assert_eq!(audio(&stream("running", "browser", false), &c).len(), 1);
+    }
+    #[test]
+    fn firefox_dummy_streams_never_inhibit_but_real_playback_still_does() {
+        let c = vigil_core::Config::parse("[activity]\nignore_audio = []")
+            .unwrap()
+            .activity;
+        for dummy in ["speech-dispatcher-dummy", "sd_dummy"] {
+            for key in [
+                "application.name",
+                "application.process.binary",
+                "node.name",
+            ] {
+                let mut objects = stream("running", "Firefox", false);
+                objects[0]["info"]["props"][key] = json!(dummy);
+                assert!(audio(&objects, &c).is_empty());
+                let mut real = stream("running", "Firefox", false);
+                real[0]["id"] = json!(3);
+                real[1]["info"]["output-node-id"] = json!(3);
+                objects
+                    .as_array_mut()
+                    .unwrap()
+                    .extend(real.as_array().unwrap().clone());
+                let active = audio(&objects, &c);
+                assert_eq!(active.len(), 1);
+                assert_eq!(active[0].id, "pipewire:3");
+                assert_eq!(active[0].scope, ACTIONS);
+                objects[2]["info"]["state"] = json!("suspended");
+                assert!(audio(&objects, &c).is_empty());
+            }
+        }
     }
     #[test]
     fn requires_active_link() {

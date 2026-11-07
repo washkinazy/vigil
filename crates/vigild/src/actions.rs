@@ -77,51 +77,9 @@ pub async fn lock(c: &Commands, limit: u64) -> Result<(), String> {
     }
 }
 
-// The suspend callback must never run if lock confirmation fails.
-pub async fn lock_then_suspend<L, LF, S, SF>(lock_fn: L, suspend_fn: S) -> Result<(), String>
-where
-    L: FnOnce() -> LF,
-    LF: std::future::Future<Output = Result<(), String>>,
-    S: FnOnce() -> SF,
-    SF: std::future::Future<Output = Result<(), String>>,
-{
-    lock_fn().await?;
-    suspend_fn().await
-}
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[tokio::test]
-    async fn failed_lock_never_suspends() {
-        let called = std::cell::Cell::new(false);
-        let result = lock_then_suspend(
-            || async { Err("lock failed".into()) },
-            || async {
-                called.set(true);
-                Ok(())
-            },
-        )
-        .await;
-        assert!(result.is_err());
-        assert!(!called.get());
-    }
-    #[tokio::test]
-    async fn lock_precedes_suspend() {
-        let order = std::cell::RefCell::new(Vec::new());
-        lock_then_suspend(
-            || async {
-                order.borrow_mut().push("locked");
-                Ok(())
-            },
-            || async {
-                order.borrow_mut().push("suspend");
-                Ok(())
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(*order.borrow(), vec!["locked", "suspend"]);
-    }
     #[tokio::test]
     async fn subprocess_failure_and_timeout() {
         assert!(run(&["false"], 1).await.is_err());
