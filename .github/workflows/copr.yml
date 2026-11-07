@@ -1,0 +1,58 @@
+name: Build COPR release
+on:
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+    secrets:
+      COPR_CONFIG:
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to build (for example v0.1.1)'
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: copr-${{ inputs.tag }}
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: registry.fedoraproject.org/fedora:45
+    timeout-minutes: 15
+    steps:
+      - name: Validate release tag
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: '[[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]'
+      - name: Install build submission tools
+        run: dnf install -y git copr-cli rpm-build systemd-rpm-macros
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          persist-credentials: false
+      - name: Verify tag and package versions agree
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: python3 scripts/check-version.py --tag "$RELEASE_TAG"
+      - name: Submit tagged sources to COPR
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          COPR_CONFIG: ${{ secrets.COPR_CONFIG }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$COPR_CONFIG"
+          umask 077
+          config=$(mktemp)
+          trap 'rm -f "$config"' EXIT
+          printf '%s\n' "$COPR_CONFIG" > "$config"
+          copr-cli --config "$config" buildscm washkinazy/vigil \
+            --clone-url https://github.com/washkinazy/vigil.git \
+            --type git --commit "$RELEASE_TAG" \
+            --subdir packaging --spec vigil.spec --method rpkg --nowait
