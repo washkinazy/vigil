@@ -28,11 +28,6 @@ async fn request(path: &PathBuf, r: Request) -> Result<Response, String> {
     .map_err(|_| "Vigil did not respond within 35 seconds".to_string())?
 }
 fn waybar(s: &Status) -> serde_json::Value {
-    let mut lines = vec![if s.dry_run {
-        "Vigil (dry-run)".into()
-    } else {
-        "Vigil".into()
-    }];
     let toggled = s.manual_inhibitors.iter().any(|i| i.id == "manual:toggle");
     let (icon, class) = if toggled {
         ("", "manual")
@@ -41,19 +36,20 @@ fn waybar(s: &Status) -> serde_json::Value {
     } else {
         ("", "automatic")
     };
-    lines.push(if toggled {
-        "Keep-awake toggle: on".into()
+    let state = if toggled {
+        "Keep awake"
+    } else if s.inhibitors.is_empty() {
+        "Automatic"
     } else {
-        "Keep-awake toggle: off".into()
-    });
-    lines.push(if toggled {
-        "Click to disable this toggle; other inhibitors remain active.".into()
-    } else {
-        "Click to keep awake (prevent automatic display blanking, locking, and suspend).".into()
-    });
+        "Inhibited"
+    };
+    let mut lines = vec![format!(
+        "Vigil — {state}{}",
+        if s.dry_run { " (dry-run)" } else { "" }
+    )];
     let mut reasons = std::collections::BTreeMap::new();
     for i in &s.inhibitors {
-        if i.id == "compositor" {
+        if i.id == "compositor" || i.id == "manual:toggle" {
             continue;
         }
         let reason = if let Some(app) = i
@@ -70,10 +66,7 @@ fn waybar(s: &Status) -> serde_json::Value {
         reasons.entry(reason.to_lowercase()).or_insert(reason);
     }
     if reasons.is_empty() && s.inhibitors.iter().any(|i| i.id == "compositor") {
-        reasons.insert(
-            "application".into(),
-            "An application is keeping the session awake".into(),
-        );
+        reasons.insert("application".into(), "Application inhibition".into());
     }
     lines.extend(reasons.values().take(4).cloned());
     if reasons.len() > 4 {
@@ -254,16 +247,11 @@ mod tests {
         }
     }
     #[test]
-    fn automatic_button_stays_visible_and_offers_keep_awake() {
+    fn automatic_button_stays_visible_with_concise_status() {
         let v = waybar(&status());
         assert!(!v["text"].as_str().unwrap().is_empty());
         assert_eq!(v["class"], "automatic");
-        assert!(
-            v["tooltip"]
-                .as_str()
-                .unwrap()
-                .contains("Click to keep awake")
-        );
+        assert_eq!(v["tooltip"], "Vigil — Automatic");
     }
     #[test]
     fn only_dedicated_toggle_marks_button_manual() {
@@ -281,7 +269,12 @@ mod tests {
         });
         let v = waybar(&s);
         assert_eq!(v["class"], "inhibited");
-        assert!(v["tooltip"].as_str().unwrap().contains("toggle: off"));
+        assert!(
+            v["tooltip"]
+                .as_str()
+                .unwrap()
+                .starts_with("Vigil — Inhibited")
+        );
         assert!(
             v["tooltip"]
                 .as_str()
@@ -300,7 +293,7 @@ mod tests {
             v["tooltip"]
                 .as_str()
                 .unwrap()
-                .contains("other inhibitors remain active")
+                .starts_with("Vigil — Keep awake")
         );
         s.manual_inhibitors.pop();
         assert_eq!(waybar(&s)["class"], "inhibited");
@@ -315,8 +308,18 @@ mod tests {
         });
         let v = waybar(&s);
         assert_eq!(v["class"], "inhibited");
-        assert!(v["tooltip"].as_str().unwrap().contains("toggle: off"));
-        assert!(v["tooltip"].as_str().unwrap().contains("An application"));
+        assert!(
+            v["tooltip"]
+                .as_str()
+                .unwrap()
+                .starts_with("Vigil — Inhibited")
+        );
+        assert!(
+            v["tooltip"]
+                .as_str()
+                .unwrap()
+                .contains("Application inhibition")
+        );
     }
     #[test]
     fn tooltip_escapes_external_labels() {

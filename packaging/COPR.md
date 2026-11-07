@@ -8,7 +8,10 @@ Merge ordinary PRs using Conventional Commit squash titles:
 - `docs: ...`, `test: ...`, and `chore: ...`: no release on their own.
 
 Release Please maintains one release PR with the next version and changelog.
-Merging that PR creates `vX.Y.Z` and a GitHub release. The same Actions workflow
+The release workflow enables squash auto-merge only for the generated, same-repository
+release branch with the pending-release label and a version-only diff. GitHub waits
+for the required `CI` check and an up-to-date branch before merging. Other PRs
+remain manually merged. Merging the release PR creates `vX.Y.Z` and a GitHub release. The same Actions workflow
 then submits that tag to `washkinazy/vigil` using `copr-cli buildscm` and `rpkg`.
 The RPM source URL uses the version tag too, so builds never fetch a moving main
 archive. The existing initial `0.1.0` build is the baseline; this configuration
@@ -29,7 +32,11 @@ does not republish or increment it on installation.
 2. In COPR, leave the project's Fedora targets and **Build networking** enabled.
    Disable **Auto-rebuild** on the `vigil` package. Disable/remove the old COPR
    push webhook in GitHub if one was added. Actions now submits releases directly.
-3. Merge the automation PR. Use squash merges with Conventional Commit titles,
+3. Enable repository auto-merge and apply `.github/main-ruleset.json` as a GitHub
+   branch ruleset. It requires PRs, resolved review threads, and the `CI` check
+   from GitHub Actions; it prevents deletion and force pushes with no bypass actors.
+   No second-person approval is required for this single-maintainer repository;
+   manually merging ordinary PRs is the approval step. Use squash merges with Conventional Commit titles,
    and require the CI checks before merging PRs. Generated release PRs run version
    and release-config validation; their Fedora matrix is skipped only when the
    diff contains release metadata alone. CI-only and documentation-only PRs also

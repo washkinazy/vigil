@@ -158,8 +158,7 @@ The button remains visible in automatic mode. Its CSS class is `automatic` when
 there are no inhibitors, `manual` when the dedicated keep-awake toggle is on,
 and `inhibited` when other requests or application activity inhibit actions.
 Manual mode uses a coffee icon; other inhibition uses an eye, and automatic mode
-uses an eye with a slash. The tooltip describes the next click and lists activity
-reasons. Turning the toggle off preserves other keep-awake requests and application
+uses an eye with a slash. The tooltip shows the current state and activity reasons. Turning the toggle off preserves other keep-awake requests and application
 inhibitors. A disconnected daemon shows a warning with the `error` class.
 
 Replace Waybar's `idle_inhibitor` module with `custom/vigil` to use this button.

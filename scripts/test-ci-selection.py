@@ -82,5 +82,79 @@ class SelectionTests(unittest.TestCase):
         )
 
 
+class ReleaseMergeTests(unittest.TestCase):
+    def test_only_generated_release_identity_is_eligible(self):
+        import copy
+
+        module_spec = importlib.util.spec_from_file_location(
+            "auto_merge", Path(__file__).with_name("auto-merge-release.py")
+        )
+        module = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(module)
+        pr = {
+            "state": "open",
+            "draft": False,
+            "base": {"ref": "main"},
+            "head": {
+                "ref": "release-please--branches--main",
+                "repo": {"full_name": "owner/repo"},
+            },
+            "labels": [{"name": "autorelease: pending"}],
+        }
+        self.assertTrue(module.eligible(pr, "owner/repo"))
+        for key, value in [
+            ("state", "closed"),
+            ("draft", True),
+            ("labels", []),
+            ("base", {"ref": "other"}),
+            ("head", {"ref": "feature", "repo": {"full_name": "owner/repo"}}),
+            (
+                "head",
+                {
+                    "ref": "release-please--branches--main",
+                    "repo": {"full_name": "fork/repo"},
+                },
+            ),
+        ]:
+            changed = copy.deepcopy(pr)
+            changed[key] = value
+            self.assertFalse(module.eligible(changed, "owner/repo"))
+
+    def test_required_ci_rejects_failed_cancelled_or_missing_checks(self):
+        import os
+        import subprocess
+
+        text = (
+            Path(__file__).resolve().parents[1] / ".github/workflows/check.yml"
+        ).read_text()
+        gate = text.split("      - name: Require all applicable checks", 1)[1].split(
+            "        run: |\n", 1
+        )[1]
+        script = "set -e\n" + "\n".join(line[10:] for line in gate.splitlines())
+        env = {
+            **os.environ,
+            "CLASSIFY": "success",
+            "WORKFLOWS": "success",
+            "RELEASE": "success",
+            "BUILD_REQUIRED": "true",
+            "BUILD": "success",
+        }
+
+        def passes(values):
+            return (
+                subprocess.run(
+                    ["bash", "-c", script], env=values, check=False
+                ).returncode
+                == 0
+            )
+
+        self.assertTrue(passes(env))
+        self.assertTrue(passes({**env, "BUILD_REQUIRED": "false", "BUILD": "skipped"}))
+        for key in ["CLASSIFY", "WORKFLOWS", "RELEASE", "BUILD"]:
+            for value in ["failure", "cancelled", "skipped", ""]:
+                self.assertFalse(passes({**env, key: value}))
+        self.assertFalse(passes({**env, "BUILD_REQUIRED": ""}))
+
+
 if __name__ == "__main__":
     unittest.main()
