@@ -1,29 +1,73 @@
-# COPR package settings
+# Releases and COPR
 
-| Field | Value |
+Merge ordinary PRs using Conventional Commit squash titles:
+
+- `fix: ...`: patch release (`0.1.0` → `0.1.1`).
+- `feat: ...`: minor release (`0.1.0` → `0.2.0`).
+- `feat!: ...` or a `BREAKING CHANGE:` footer: minor before 1.0, major after 1.0.
+- `docs: ...`, `test: ...`, and `chore: ...`: no release on their own.
+
+Release Please maintains one release PR with the next version and changelog.
+Merging that PR creates `vX.Y.Z` and a GitHub release. The same Actions workflow
+then submits that tag to `washkinazy/vigil` using `copr-cli buildscm` and `rpkg`.
+The RPM source URL uses the version tag too, so builds never fetch a moving main
+archive. The existing initial `0.1.0` build is the baseline; this configuration
+does not republish or increment it on installation.
+
+## One-time setup
+
+1. In GitHub **Settings → Secrets and variables → Actions**, add:
+   - `RELEASE_PLEASE_TOKEN`: a fine-grained GitHub PAT restricted to this repo,
+     with **Contents**, **Pull requests**, and **Issues** read/write permissions.
+     This lets release PRs run normal CI; the built-in `GITHUB_TOKEN` suppresses
+     workflows triggered by its own changes. Approve the token if required by
+     the repository owner/organization.
+   - `COPR_CONFIG`: the complete INI configuration from the
+     [COPR API configuration](https://copr.fedorainfracloud.org/api/), including
+     the `[copr-cli]` section. This secret is already configured in this repo.
+     Its account must have build permission on `washkinazy/vigil`.
+2. In COPR, leave the project's Fedora targets and **Build networking** enabled.
+   Disable **Auto-rebuild** on the `vigil` package. Disable/remove the old COPR
+   push webhook in GitHub if one was added. Actions now submits releases directly.
+3. Merge the automation PR. Use squash merges with Conventional Commit titles,
+   and require the normal CI and release-config checks before merging release PRs.
+
+No per-release changes to COPR's Committish or spec settings are required.
+The submission passes all source settings each time:
+
+| Setting | Automatic value |
 | --- | --- |
-| Package name | `vigil` |
-| Type | Git |
 | Clone URL | `https://github.com/washkinazy/vigil.git` |
-| Committish | `main` |
+| Committish | Newly created `vX.Y.Z` tag |
 | Subdirectory | `packaging` |
 | Spec file | `vigil.spec` |
-| SRPM build method | `rpkg` |
-| Auto-rebuild | enabled |
-| Build networking | enabled |
+| Build method | `rpkg` |
 
-The spec downloads the main-branch source archive and builds with Cargo.lock.
-Push the source and spec before starting the first COPR build. Connect the GitHub
-push webhook from COPR Settings → Integrations for subsequent builds.
+The submission job prints the COPR build URL and exits after queuing it;
+GitHub submission success does not mean the COPR build has finished. COPR signs
+and publishes successful RPMs in the existing repository. If submission fails,
+rerun the failed job. For a failed COPR build or a deliberate rebuild, run
+**Actions → Build COPR release → Run workflow** on `main` and supply the existing
+tag. This builds tags created after the automation was installed. A rerun may
+create another COPR build of the same version; it never increments a version.
 
-The first package is `vigil-0.1.0-1`. Cargo's workspace version and RPM `Version`
-identify the upstream release and must match; CI checks this. RPM `Release`
-identifies packaging revisions of that upstream version. Reset it to `1` when
-`Version` changes. Tags and automated increment workflows come after the initial
-build. Until then, the spec builds the `main` archive.
+## Version files
 
-The RPM installs the two binaries under `/usr/bin`, a vendor systemd user unit,
-and the example config under `/usr/share/doc/vigil`. It does not start or restart
-Vigil. Existing `~/.local/bin` binaries and a user-level `vigil.service` take
-precedence over the packaged files; switching an existing installation is a
-separate migration.
+`VERSION` holds the shared product version. Release Please updates it alongside
+`Cargo.toml`, the three local packages in `Cargo.lock`, `packaging/vigil.spec`,
+and `CHANGELOG.md`. Crates continue to inherit the workspace version. CI checks
+that they agree and rejects a COPR tag that differs from the package version.
+The release manifest is Release Please's bookkeeping; release PRs update it
+alongside the version files.
+
+The simple strategy with targeted TOML updates preserves the virtual workspace's
+inherited versions; the Rust strategy does not support that layout reliably.
+Keep RPM `Release` at `1` for these upstream releases. Packaging fixes that need
+a new published package use `fix(packaging): ...` and receive a patch version.
+Dependency updates never rewrite unrelated locked versions during a release bump.
+
+No service is enabled, started, or restarted by the release workflow. Switching
+an existing local installation to the RPM remains a separate migration.
+
+References: [Release Please](https://github.com/googleapis/release-please-action),
+[COPR SCM builds](https://docs.copr.fedorainfracloud.org/user_documentation.html#scm).
