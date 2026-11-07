@@ -20,7 +20,7 @@ Audio scopes and all timeouts are configurable. Set a timeout to zero to disable
 that action. Expired/released inhibitors give affected actions at least 60 seconds
 of grace, or their remaining ordinary idle timeout, whichever is longer. An action
 runs once per idle cycle; failures retry after 30 seconds. Input and resume reset
-timers. Restart starts a fresh idle cycle and clears manual overrides.
+timers. Restart starts a fresh idle cycle and clears manual inhibitors.
 
 Vigil uses native `ext-idle-notify-v1` **version 2** notifications, including the
 input-only variant, to distinguish physical inactivity from compositor inhibition.
@@ -86,7 +86,7 @@ previous startup entries, and start the old idle services.
 Use [config.example.toml](config.example.toml) as the configuration reference.
 Unknown keys, invalid scopes, and unsafe empty commands fail validation. Changes
 can be applied with `vigilctl reload` or `systemctl --user reload vigil`. Invalid TOML leaves the current configuration
-untouched. Successful reload resets idle timers, preserves manual overrides,
+untouched. Successful reload resets idle timers, preserves manual inhibitors,
 restores blanked displays using the previous command, and refreshes sensor policy.
 Automatic actions wait for a fresh observation; stale pre-reload observations are
 discarded. Sleep preparation uses the latest validated locker settings.
@@ -114,17 +114,29 @@ Vigil's own suspend timer. Dry-run never writes IdleHint.
 ```sh
 vigilctl status
 vigilctl status --json
-vigilctl keep-awake 1h
-vigilctl keep-awake 30m --scope suspend
-vigilctl keep-awake                 # until cleared or daemon restart
-vigilctl automatic
-vigilctl toggle                     # atomically toggle manual all-action keep-awake
+vigilctl keep-awake 1h --reason "Presentation"
+vigilctl keep-awake 30m --scope suspend --reason "Download"
+vigilctl keep-awake                 # until released or daemon restart
+# Each keep-awake prints an ID, for example manual:1.
+vigilctl release manual:1           # release only that request
+vigilctl automatic                 # clear all manual requests
+vigilctl toggle                     # toggle its own all-action request
 vigilctl reload                     # validate and apply TOML without restarting
 vigilctl lock
 vigilctl suspend
 vigilctl wake
 vigilctl waybar --watch
 ```
+
+Each `keep-awake` creates an independent inhibitor with its own scope, reason,
+and optional expiration. Removing or expiring one preserves all other requests.
+`toggle` atomically controls the dedicated `manual:toggle` inhibitor, so a
+keybinding cannot accidentally clear a download or presentation request.
+`automatic` explicitly clears all manual inhibitors; observed application
+activity still applies. `status` shows request IDs and remaining times;
+`status --json` exposes them in `manual_inhibitors` (a null `remaining_seconds`
+means no expiration). Reasons must be nonblank, at most 256 bytes, and contain
+no control characters. IDs are valid only for the current daemon process.
 
 The Waybar output is newline-delimited JSON with escaped tooltips containing a
 compact list of activity reasons. Duplicate media sources are combined; detailed
@@ -190,8 +202,8 @@ validation because it interrupts the desktop.
 - Unavailable Wayland observation blocks all automatic actions; unavailable
   PipeWire observation blocks suspend. Other backend failures appear in health.
   Missing MPRIS/fullscreen/logind observations cannot reconstruct unknown activity.
-- Manual overrides are process-local. Only one manual override exists; a new one
-  replaces it. `toggle` runs atomically in the daemon, including concurrent clients.
+- Manual inhibitors are process-local and are cleared by a daemon restart.
+  They survive configuration reloads; restart persistence is not implemented.
 - Night-color control belongs to the desktop's Redshift/Gammastep configuration;
   Vigil does not change it.
 - Niri is the supported compositor. Other compositors need compatible idle
