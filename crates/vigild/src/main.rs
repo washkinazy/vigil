@@ -11,7 +11,7 @@ use std::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::UnixListener,
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
     time::{Instant, timeout},
 };
 use vigil_core::{ACTIONS, Action, Config, Inhibitor, Policy, Request, Response, Status};
@@ -22,11 +22,14 @@ pub enum Event {
     Health(String, Option<String>),
     Sleep(bool),
     LockRequested,
-    Sensors(Vec<Inhibitor>, BTreeMap<String, String>),
+    Sensors(u64, Vec<Inhibitor>, BTreeMap<String, String>),
     Control(Request, oneshot::Sender<Response>),
 }
 struct Runtime {
     c: Config,
+    config_file: PathBuf,
+    config_tx: watch::Sender<(u64, Config)>,
+    revision: u64,
     dry: bool,
     policy: Policy,
     sensors: Vec<Inhibitor>,
@@ -57,10 +60,10 @@ impl Runtime {
                 scope: ACTIONS.to_vec(),
             });
         }
-        if self.health.contains_key("wayland") {
+        if self.health.contains_key("wayland") || self.health.contains_key("sensors") {
             list.push(Inhibitor {
                 id: "degraded:wayland".into(),
-                reason: "Idle observation unavailable".into(),
+                reason: "Idle or activity observation unavailable".into(),
                 scope: ACTIONS.to_vec(),
             });
         }
@@ -263,6 +266,7 @@ async fn start() -> Result<(), String> {
         println!("Configuration valid: {}", path.display());
         return Ok(());
     }
+    let config_file = path;
     let path = match socket {
         Some(p) => p,
         None => socket_path()?,
@@ -270,14 +274,19 @@ async fn start() -> Result<(), String> {
     let (tx, mut rx) = mpsc::unbounded_channel();
     serve(path.clone(), tx.clone()).await?;
     let clock = Instant::now();
+    let (config_tx, config_rx) = watch::channel((0, c.clone()));
     let mut r = Runtime {
         c: c.clone(),
+        config_file,
+        config_tx,
+        revision: 0,
         dry,
         policy: Policy::new(0),
         sensors: vec![],
         health: BTreeMap::from([
             ("wayland".into(), "initializing".into()),
             ("logind".into(), "initializing".into()),
+            ("sensors".into(), "initializing".into()),
         ]),
         sensor_health: BTreeMap::new(),
         input_idle: false,
@@ -288,13 +297,19 @@ async fn start() -> Result<(), String> {
         last_action: None,
     };
     wayland::start(tx.clone());
-    logind::start(tx.clone(), c.commands.clone(), dry);
+    logind::start(tx.clone(), config_rx.clone(), dry);
     let sensor_tx = tx.clone();
-    let activity = c.activity.clone();
+    let mut config_rx = config_rx;
     tokio::spawn(async move {
         let mut bus = None;
         loop {
-            let (mut list, mut health) = sensors::gather(&activity).await;
+            let (revision, config) = config_rx.borrow_and_update().clone();
+            let activity = config.activity;
+            let gathered = tokio::select! {
+                result = sensors::gather(&activity) => result,
+                _ = config_rx.changed() => continue,
+            };
+            let (mut list, mut health) = gathered;
             if bus.is_none() {
                 bus = zbus::Connection::system().await.ok();
             }
@@ -315,10 +330,16 @@ async fn start() -> Result<(), String> {
                     "System bus unavailable".into(),
                 );
             }
-            if sensor_tx.send(Event::Sensors(list, health)).is_err() {
+            if sensor_tx
+                .send(Event::Sensors(revision, list, health))
+                .is_err()
+            {
                 break;
             }
-            tokio::time::sleep(Duration::from_secs(activity.poll_seconds)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(activity.poll_seconds)) => {},
+                _ = config_rx.changed() => {},
+            }
         }
     });
     let mut tick = tokio::time::interval(Duration::from_millis(250));
@@ -368,6 +389,33 @@ impl Runtime {
     async fn control(&mut self, request: Request, now: u64) -> Result<String, String> {
         match request {
             Request::Status => Ok("status".into()),
+            Request::Reload => {
+                let text = std::fs::read_to_string(&self.config_file).map_err(|e| e.to_string())?;
+                let next = Config::parse(&text)?;
+                if self.blanked {
+                    self.wake().await?;
+                }
+                self.c = next;
+                self.revision += 1;
+                self.policy.activity(now);
+                self.sensors.clear();
+                self.sensor_health.clear();
+                self.health.insert(
+                    "sensors".into(),
+                    "Refreshing after configuration reload".into(),
+                );
+                self.config_tx.send_replace((self.revision, self.c.clone()));
+                Ok("Configuration reloaded; idle timers reset, manual override preserved".into())
+            }
+            Request::Toggle => {
+                self.inhibitors(now);
+                if self.manual.take().is_some() {
+                    Ok("Automatic policy restored".into())
+                } else {
+                    self.manual = Some((None, ACTIONS.to_vec()));
+                    Ok("Manual keep-awake enabled".into())
+                }
+            }
             Request::KeepAwake { seconds, scope } => {
                 if scope.is_empty() || seconds == Some(0) {
                     return Err("scope and duration must be nonempty/positive".into());
@@ -410,7 +458,11 @@ impl Runtime {
                     self.health.remove(&name);
                 }
             }
-            Event::Sensors(list, health) => {
+            Event::Sensors(revision, list, health) => {
+                if revision != self.revision {
+                    return;
+                }
+                self.health.remove("sensors");
                 self.sensors = list;
                 self.sensor_health = health;
             }
@@ -476,6 +528,9 @@ mod tests {
     fn runtime() -> Runtime {
         Runtime {
             c: Config::default(),
+            config_file: PathBuf::new(),
+            config_tx: watch::channel((0, Config::default())).0,
+            revision: 0,
             dry: true,
             policy: Policy::new(0),
             sensors: vec![],
@@ -562,5 +617,39 @@ mod tests {
         assert!(!r.sleeping);
         assert_eq!(r.status(3000).idle_seconds, 0);
         assert_eq!(r.inhibitors(3000).len(), 1);
+    }
+    #[tokio::test]
+    async fn toggle_expires_old_override_before_deciding() {
+        let mut r = runtime();
+        r.manual = Some((Some(2), vec![Action::Suspend]));
+        r.control(Request::Toggle, 3).await.unwrap();
+        assert_eq!(r.manual, Some((None, ACTIONS.to_vec())));
+        r.control(Request::Toggle, 3).await.unwrap();
+        assert!(r.manual.is_none());
+    }
+    #[tokio::test]
+    async fn reload_rejects_invalid_config_and_preserves_manual_override() {
+        let mut r = runtime();
+        let path =
+            std::env::temp_dir().join(format!("vigil-reload-test-{}.toml", std::process::id()));
+        r.config_file = path.clone();
+        r.manual = Some((Some(5000), vec![Action::Suspend]));
+        std::fs::write(&path, "[timeouts]\nlock_seconds = 42").unwrap();
+        r.control(Request::Reload, 2000).await.unwrap();
+        assert_eq!(r.c.timeouts.lock_seconds, 42);
+        assert_eq!(r.policy.elapsed(2000), 0);
+        assert_eq!(r.manual, Some((Some(5000), vec![Action::Suspend])));
+        assert!(r.status(2000).timers.iter().all(|t| t.blocked));
+        r.event(Event::Sensors(0, vec![], BTreeMap::new()), 2001)
+            .await;
+        assert!(r.health.contains_key("sensors"));
+        r.event(Event::Sensors(1, vec![], BTreeMap::new()), 2002)
+            .await;
+        assert!(!r.health.contains_key("sensors"));
+        std::fs::write(&path, "invalid = true").unwrap();
+        assert!(r.control(Request::Reload, 2003).await.is_err());
+        assert_eq!(r.revision, 1);
+        assert_eq!(r.c.timeouts.lock_seconds, 42);
+        std::fs::remove_file(path).unwrap();
     }
 }

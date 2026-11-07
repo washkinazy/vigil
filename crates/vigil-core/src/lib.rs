@@ -243,6 +243,8 @@ pub enum Request {
         scope: Vec<Action>,
     },
     Automatic,
+    Toggle,
+    Reload,
     Lock,
     Suspend,
     Wake,
