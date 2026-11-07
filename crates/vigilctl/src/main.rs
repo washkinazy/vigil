@@ -6,9 +6,9 @@ use tokio::{
     net::UnixStream,
     time::timeout,
 };
-use vigil_core::{ACTIONS, Request, Response, Status, duration, markup};
+use vigil_core::{Request, Response, Status, duration, markup};
 async fn request(path: &PathBuf, r: Request) -> Result<Response, String> {
-    timeout(Duration::from_secs(35), async {
+    timeout(Duration::from_secs(95), async {
         let mut stream = UnixStream::connect(path)
             .await
             .map_err(|e| format!("{}: {e}", path.display()))?;
@@ -27,63 +27,44 @@ async fn request(path: &PathBuf, r: Request) -> Result<Response, String> {
         Ok(response)
     })
     .await
-    .map_err(|_| "Vigil did not respond within 35 seconds".to_string())?
+    .map_err(|_| "Vigil did not respond within 95 seconds".to_string())?
+}
+fn label(s: &Status) -> String {
+    if let Some(caffeine) = &s.caffeine {
+        caffeine.remaining_seconds.map_or_else(
+            || "Keep awake".into(),
+            |n| format!("Keep awake — {} min", n.div_ceil(60)),
+        )
+    } else if let Some(reason) = s.inhibitors.first() {
+        format!("Paused: {}", reason.reason)
+    } else {
+        "Automatic".into()
+    }
+}
+fn tooltip(s: &Status) -> String {
+    let mut lines = vec![format!(
+        "Vigil — {}{}",
+        label(s),
+        if s.dry_run { " (dry-run)" } else { "" }
+    )];
+    lines.extend(s.inhibitors.iter().map(|i| i.reason.clone()));
+    lines.extend(
+        s.health
+            .iter()
+            .map(|(backend, error)| format!("{backend}: {error}")),
+    );
+    lines.dedup();
+    markup(&lines.join("\n"))
 }
 fn waybar(s: &Status) -> serde_json::Value {
-    let toggled = s.manual_inhibitors.iter().any(|i| i.id == "manual:toggle");
-    let (icon, class) = if toggled {
+    let (icon, class) = if s.caffeine.is_some() {
         ("", "manual")
     } else if !s.inhibitors.is_empty() {
         ("", "inhibited")
     } else {
         ("", "automatic")
     };
-    let state = if toggled {
-        "Keep awake"
-    } else if s.inhibitors.is_empty() {
-        "Automatic"
-    } else {
-        "Inhibited"
-    };
-    let mut lines = vec![format!(
-        "Vigil — {state}{}",
-        if s.dry_run { " (dry-run)" } else { "" }
-    )];
-    let mut reasons = std::collections::BTreeMap::new();
-    for i in &s.inhibitors {
-        if i.id == "compositor" || i.id == "manual:toggle" {
-            continue;
-        }
-        let reason = if let Some(app) = i
-            .reason
-            .strip_prefix("Playback: ")
-            .or_else(|| i.reason.strip_prefix("Media playing: "))
-        {
-            format!("Media: {app}")
-        } else if let Some(app) = i.reason.strip_prefix("Fullscreen geometry: ") {
-            format!("Fullscreen: {app}")
-        } else {
-            i.reason.clone()
-        };
-        reasons.entry(reason.to_lowercase()).or_insert(reason);
-    }
-    if reasons.is_empty() && s.inhibitors.iter().any(|i| i.id == "compositor") {
-        reasons.insert("application".into(), "Application inhibition".into());
-    }
-    lines.extend(reasons.values().take(4).cloned());
-    if reasons.len() > 4 {
-        lines.push(format!("And {} more", reasons.len() - 4));
-    }
-    for manual in &s.manual_inhibitors {
-        if let Some(n) = manual.remaining_seconds {
-            lines.push(format!(
-                "{}: {} min remaining",
-                manual.reason,
-                n.div_ceil(60)
-            ));
-        }
-    }
-    serde_json::json!({"text":icon,"class":class,"tooltip":markup(&lines.join("\n"))})
+    serde_json::json!({"text":icon,"class":class,"tooltip":tooltip(s)})
 }
 #[tokio::main]
 async fn main() {
@@ -104,7 +85,7 @@ async fn start() -> Result<(), String> {
     }
     if args == ["--help"] || args == ["-h"] {
         println!(
-            "vigilctl [--socket PATH] COMMAND\n\nstatus [--json]\nexplain display|lock|suspend\nwaybar [--watch]\ntray\nkeep-awake [DURATION] [--scope display,lock,suspend] [--reason TEXT]\nrelease ID\nautomatic\ntoggle\nreload\nlock\nsuspend\nwake\n\nDurations: 30s, 20m, 1h, 1d. Each keep-awake prints its ID. Omitted duration lasts until released.\nrelease removes one request; automatic clears all manual requests.\ntoggle controls its own all-action request and preserves other requests.\nExplicit lock/suspend commands bypass activity inhibitors; suspend requires confirmed lock."
+            "vigilctl [--socket PATH] COMMAND\n\nstatus [--json]\nexplain display|lock|suspend\nwaybar [--watch]\ntray\nkeep-awake [DURATION]\nautomatic\ntoggle\nreload\nlock\nsuspend\nwake\n\nDurations: 30s, 20m, 1h, 1d. Keep-awake replaces the current caffeine override.\nOmitted duration lasts until toggled off, automatic, or daemon restart.\nExplicit lock/suspend bypass activity inhibitors; suspend requires confirmed lock."
         );
         return Ok(());
     }
@@ -134,46 +115,14 @@ async fn start() -> Result<(), String> {
         },
         "tray" if args.len() == 1 => Request::Status,
         "automatic" if args.len() == 1 => Request::Automatic,
-        "release" if args.len() == 2 => Request::Release {
-            id: args[1].clone(),
-        },
         "lock" if args.len() == 1 => Request::Lock,
         "suspend" if args.len() == 1 => Request::Suspend,
         "wake" if args.len() == 1 => Request::Wake,
         "toggle" if args.len() == 1 => Request::Toggle,
         "reload" if args.len() == 1 => Request::Reload,
-        "keep-awake" => {
-            let mut seconds = None;
-            let mut scope = ACTIONS.to_vec();
-            let mut reason = "Manual keep-awake".to_string();
-            let mut tail = args.iter().skip(1);
-            while let Some(arg) = tail.next() {
-                if arg == "--scope" {
-                    scope = tail
-                        .next()
-                        .ok_or("--scope requires comma separated actions")?
-                        .split(',')
-                        .map(|s| match s {
-                            "display" => Ok(vigil_core::Action::Display),
-                            "lock" => Ok(vigil_core::Action::Lock),
-                            "suspend" => Ok(vigil_core::Action::Suspend),
-                            _ => Err("scope must contain display,lock,suspend"),
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                } else if arg == "--reason" {
-                    reason = tail.next().ok_or("--reason requires text")?.clone();
-                } else if seconds.is_none() {
-                    seconds = Some(duration(arg)?);
-                } else {
-                    return Err("unexpected argument".into());
-                }
-            }
-            Request::KeepAwake {
-                seconds,
-                scope,
-                reason,
-            }
-        }
+        "keep-awake" if args.len() <= 2 => Request::KeepAwake {
+            seconds: args.get(1).map(|s| duration(s)).transpose()?,
+        },
         _ => return Err("unsupported command or arguments; see --help".into()),
     };
     let path = match socket {
@@ -227,13 +176,13 @@ async fn start() -> Result<(), String> {
                 for i in &s.inhibitors {
                     println!("  {}: {} [{:?}]", i.id, i.reason, i.scope);
                 }
-                for manual in &s.manual_inhibitors {
+                if let Some(caffeine) = &s.caffeine {
                     println!(
-                        "  {}: {}",
-                        manual.id,
-                        manual
-                            .remaining_seconds
-                            .map_or_else(|| "until released".into(), |n| format!("{n}s remaining"))
+                        "  Keep awake: {}",
+                        caffeine.remaining_seconds.map_or_else(
+                            || "until disabled or restarted".into(),
+                            |n| format!("{n}s remaining")
+                        )
                     );
                 }
                 for t in &s.timers {
@@ -264,106 +213,27 @@ mod tests {
             timers: vec![],
             health: Default::default(),
             last_action: None,
-            manual_inhibitors: vec![],
+            caffeine: None,
         }
     }
     #[test]
-    fn automatic_button_stays_visible_with_concise_status() {
-        let v = waybar(&status());
-        assert!(!v["text"].as_str().unwrap().is_empty());
-        assert_eq!(v["class"], "automatic");
-        assert_eq!(v["tooltip"], "Vigil — Automatic");
-    }
-    #[test]
-    fn only_dedicated_toggle_marks_button_manual() {
+    fn status_distinguishes_automatic_caffeine_and_application_pause() {
         let mut s = status();
+        assert_eq!(waybar(&s)["class"], "automatic");
         s.inhibitors.push(vigil_core::Inhibitor {
-            id: "manual:1".into(),
-            reason: "Download".into(),
-            scope: vec![vigil_core::Action::Suspend],
+            id: "media".into(),
+            reason: "Music <&>".into(),
+            scope: vigil_core::ACTIONS.to_vec(),
         });
-        s.manual_inhibitors.push(vigil_core::ManualStatus {
-            id: "manual:1".into(),
-            reason: "Download".into(),
-            scope: vec![vigil_core::Action::Suspend],
+        assert_eq!(label(&s), "Paused: Music <&>");
+        assert!(tooltip(&s).contains("Music &lt;&amp;&gt;"));
+        assert_eq!(waybar(&s)["class"], "inhibited");
+        s.caffeine = Some(vigil_core::CaffeineStatus {
             remaining_seconds: Some(90),
         });
-        let v = waybar(&s);
-        assert_eq!(v["class"], "inhibited");
-        assert!(
-            v["tooltip"]
-                .as_str()
-                .unwrap()
-                .starts_with("Vigil — Inhibited")
-        );
-        assert!(
-            v["tooltip"]
-                .as_str()
-                .unwrap()
-                .contains("Download: 2 min remaining")
-        );
-        s.manual_inhibitors.push(vigil_core::ManualStatus {
-            id: "manual:toggle".into(),
-            reason: "Toggle".into(),
-            scope: ACTIONS.to_vec(),
-            remaining_seconds: None,
-        });
-        let v = waybar(&s);
-        assert_eq!(v["class"], "manual");
-        assert!(
-            v["tooltip"]
-                .as_str()
-                .unwrap()
-                .starts_with("Vigil — Keep awake")
-        );
-        s.manual_inhibitors.pop();
-        assert_eq!(waybar(&s)["class"], "inhibited");
-    }
-    #[test]
-    fn application_inhibition_does_not_claim_toggle_is_on() {
-        let mut s = status();
-        s.inhibitors.push(vigil_core::Inhibitor {
-            id: "compositor".into(),
-            reason: "Application".into(),
-            scope: ACTIONS.to_vec(),
-        });
-        let v = waybar(&s);
-        assert_eq!(v["class"], "inhibited");
-        assert!(
-            v["tooltip"]
-                .as_str()
-                .unwrap()
-                .starts_with("Vigil — Inhibited")
-        );
-        assert!(
-            v["tooltip"]
-                .as_str()
-                .unwrap()
-                .contains("Application inhibition")
-        );
-    }
-    #[test]
-    fn tooltip_escapes_external_labels() {
-        let s = Status {
-            idle_hint: None,
-            dry_run: false,
-            idle_seconds: 0,
-            inhibitors: vec![vigil_core::Inhibitor {
-                id: "x".into(),
-                reason: "<player & app>".into(),
-                scope: ACTIONS.to_vec(),
-            }],
-            timers: vec![],
-            health: Default::default(),
-            last_action: None,
-            manual_inhibitors: vec![],
-        };
-        let v = waybar(&s);
-        assert!(
-            v["tooltip"]
-                .as_str()
-                .unwrap()
-                .contains("&lt;player &amp; app&gt;")
-        );
+        assert_eq!(label(&s), "Keep awake — 2 min");
+        assert_eq!(waybar(&s)["class"], "manual");
+        s.health.insert("mpris".into(), "Disconnected <&>".into());
+        assert!(tooltip(&s).contains("Disconnected &lt;&amp;&gt;"));
     }
 }

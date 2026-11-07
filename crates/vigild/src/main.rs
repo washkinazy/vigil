@@ -1,7 +1,6 @@
 mod actions;
 mod idle_hint;
 mod logind;
-mod manual_store;
 mod observers;
 mod sensors;
 mod wayland;
@@ -17,9 +16,7 @@ use tokio::{
     sync::{mpsc, oneshot, watch},
     time::{Instant, timeout},
 };
-use vigil_core::{
-    ACTIONS, Action, Config, Inhibitor, ManualInhibitors, Policy, Request, Response, Status,
-};
+use vigil_core::{ACTIONS, Action, Caffeine, Config, Inhibitor, Policy, Request, Response, Status};
 
 pub enum Event {
     IdleHint(Option<bool>),
@@ -45,15 +42,18 @@ struct Runtime {
     effective_idle: bool,
     sleeping: bool,
     blanked: bool,
-    manual: ManualInhibitors,
-    manual_store: Option<manual_store::Store>,
+    caffeine: Caffeine,
+    pending: Option<Pending>,
+    cycle: u64,
+    wake_retry_at: u64,
+    wake_requested: bool,
+    lock_requested: bool,
     last_action: Option<String>,
     idle_hint: Option<bool>,
     idle_hint_tx: watch::Sender<Option<bool>>,
 }
 impl Runtime {
     fn inhibitors(&mut self, now: u64) -> Vec<Inhibitor> {
-        self.manual.expire(now);
         let mut list = self.sensors.clone();
         if self.input_idle && !self.effective_idle {
             list.push(Inhibitor {
@@ -69,11 +69,11 @@ impl Runtime {
                 scope: ACTIONS.to_vec(),
             });
         }
-        for manual in self.manual.status(now) {
+        if self.caffeine.status(now).is_some() {
             list.push(Inhibitor {
-                id: manual.id,
-                reason: manual.reason,
-                scope: manual.scope,
+                id: "caffeine".into(),
+                reason: "Keep awake".into(),
+                scope: ACTIONS.to_vec(),
             });
         }
         list
@@ -91,40 +91,132 @@ impl Runtime {
             timers,
             health,
             last_action: self.last_action.clone(),
-            manual_inhibitors: self.manual.status(now),
+            caffeine: self.caffeine.status(now),
         }
     }
-    async fn action(&mut self, a: Action) -> Result<(), String> {
-        if self.dry {
-            self.last_action = Some(format!("dry-run: would {a:?}"));
-            return Ok(());
-        }
-        let c = &self.c.commands;
-        let result = match a {
-            Action::Display => actions::output(&c.display_off, 5).await.map(|_| ()),
-            Action::Lock => actions::lock(c, c.lock_timeout_seconds).await,
-            Action::Suspend => {
-                actions::lock_then_suspend(
-                    || actions::lock(c, c.lock_timeout_seconds),
-                    || async { actions::output(&c.suspend, 10).await.map(|_| ()) },
-                )
-                .await
+    fn begin(&mut self, work: Work, automatic: bool, reply: Option<oneshot::Sender<Response>>) {
+        let commands = self.c.commands.clone();
+        let dry = self.dry;
+        let task = tokio::spawn(async move {
+            if dry {
+                return Ok(());
             }
-        };
-        self.last_action = Some(match &result {
-            Ok(()) => format!("Completed {a:?}"),
-            Err(e) => format!("Failed {a:?}: {e}"),
+            match work {
+                Work::Action(Action::Display) => {
+                    actions::output(&commands.display_off, 5).await.map(|_| ())
+                }
+                Work::Action(Action::Lock) | Work::PrepareSuspend => {
+                    actions::lock(&commands, commands.lock_timeout_seconds).await
+                }
+                Work::Action(Action::Suspend) => {
+                    actions::output(&commands.suspend, 10).await.map(|_| ())
+                }
+                Work::Wake => actions::output(&commands.display_on, 5).await.map(|_| ()),
+            }
         });
-        result
+        self.pending = Some(Pending {
+            work,
+            automatic,
+            cycle: self.cycle,
+            reply,
+            task,
+        });
     }
-    async fn wake(&mut self) -> Result<(), String> {
-        if !self.dry {
-            actions::output(&self.c.commands.display_on, 5).await?;
+    fn eligible(&mut self, action: Action, now: u64) -> bool {
+        self.input_idle
+            && !self.sleeping
+            && self.status(now).timers.iter().any(|t| {
+                t.action == action
+                    && t.enabled
+                    && !t.blocked
+                    && !t.completed
+                    && t.remaining_seconds == 0
+            })
+    }
+    fn finished(&mut self, result: Result<(), String>, now: u64) {
+        let Some(pending) = self.pending.take() else {
+            return;
+        };
+        if result.is_ok() && matches!(pending.work, Work::PrepareSuspend) {
+            if !pending.automatic
+                || (pending.cycle == self.cycle && self.eligible(Action::Suspend, now))
+            {
+                self.begin(
+                    Work::Action(Action::Suspend),
+                    pending.automatic,
+                    pending.reply,
+                );
+            }
+            return;
         }
-        self.blanked = false;
-        Ok(())
+        let action = match pending.work {
+            Work::Action(action) => Some(action),
+            Work::PrepareSuspend => Some(Action::Suspend),
+            Work::Wake => None,
+        };
+        match &result {
+            Ok(()) => {
+                if let Some(action) = action {
+                    if pending.automatic
+                        && pending.cycle == self.cycle
+                        && self.eligible(action, now)
+                    {
+                        self.policy.complete(action);
+                    }
+                    if action == Action::Display {
+                        self.blanked = true;
+                        self.wake_requested |= pending.cycle != self.cycle;
+                    }
+                } else {
+                    self.blanked = false;
+                    self.wake_requested = false;
+                    self.health.remove("display");
+                }
+            }
+            Err(error) => {
+                if let Some(action) = action {
+                    self.policy.failed(action, now, &self.c);
+                } else {
+                    self.health.insert("display".into(), error.clone());
+                    self.wake_retry_at = now.saturating_add(self.c.timeouts.retry_seconds);
+                }
+            }
+        }
+        self.last_action = Some(match &result {
+            Ok(()) => format!(
+                "{} {:?}",
+                if self.dry {
+                    "dry-run: would"
+                } else {
+                    "Completed"
+                },
+                pending.work
+            ),
+            Err(error) => format!("Failed {:?}: {error}", pending.work),
+        });
+        if let Some(reply) = pending.reply {
+            let _ = reply.send(Response {
+                ok: result.is_ok(),
+                message: result.map_or_else(|e| e, |_| "Action completed".into()),
+                status: Some(self.status(now)),
+            });
+        }
     }
 }
+#[derive(Debug, Clone, Copy)]
+enum Work {
+    Action(Action),
+    PrepareSuspend,
+    Wake,
+}
+struct Pending {
+    work: Work,
+    automatic: bool,
+    cycle: u64,
+    reply: Option<oneshot::Sender<Response>>,
+    task: tokio::task::JoinHandle<Result<(), String>>,
+}
+
 fn config_path() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -202,7 +294,7 @@ async fn serve(path: PathBuf, tx: mpsc::UnboundedSender<Event>) -> Result<(), St
                         if tx.send(Event::Control(request, reply)).is_err() {
                             return;
                         }
-                        match timeout(Duration::from_secs(30), receive).await {
+                        match timeout(Duration::from_secs(90), receive).await {
                             Ok(Ok(r)) => r,
                             _ => return,
                         }
@@ -234,13 +326,12 @@ async fn start() -> Result<(), String> {
     let mut check = false;
     let mut path = config_path();
     let mut socket = None;
-    let mut state_file = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => {
                 println!(
-                    "vigild [--config PATH] [--socket PATH] [--state-file PATH] [--dry-run] [--check-config]\nNative Wayland session idle manager. Configuration: TOML."
+                    "vigild [--config PATH] [--socket PATH] [--dry-run] [--check-config]\nNative Wayland session idle manager. Configuration: TOML."
                 );
                 return Ok(());
             }
@@ -249,11 +340,6 @@ async fn start() -> Result<(), String> {
                 return Ok(());
             }
             "--dry-run" => dry = true,
-            "--state-file" => {
-                state_file = Some(PathBuf::from(
-                    args.next().ok_or("--state-file requires a path")?,
-                ))
-            }
             "--check-config" => check = true,
             "--config" => path = PathBuf::from(args.next().ok_or("--config requires a path")?),
             "--socket" => {
@@ -272,22 +358,6 @@ async fn start() -> Result<(), String> {
         return Ok(());
     }
     let config_file = path;
-    let manual_store = if dry {
-        None
-    } else {
-        // Custom sockets get their own state, avoiding interference with the session daemon.
-        let state_path =
-            state_file.or_else(|| socket.as_ref().map(|p| p.with_extension("manual.json")));
-        Some(manual_store::Store::open(match state_path {
-            Some(p) => p,
-            None => manual_store::default_path()?,
-        })?)
-    };
-    let manual = match &manual_store {
-        Some(store) => store.load(0)?,
-        None => ManualInhibitors::default(),
-    };
-
     let path = match socket {
         Some(p) => p,
         None => socket_path()?,
@@ -316,8 +386,12 @@ async fn start() -> Result<(), String> {
         effective_idle: false,
         sleeping: false,
         blanked: false,
-        manual,
-        manual_store,
+        caffeine: Caffeine::default(),
+        pending: None,
+        cycle: 0,
+        wake_retry_at: 0,
+        wake_requested: false,
+        lock_requested: false,
         last_action: None,
         idle_hint: None,
         idle_hint_tx,
@@ -335,18 +409,31 @@ async fn start() -> Result<(), String> {
     );
     loop {
         tokio::select! {
+            biased;
             _ = term.recv() => break,
             _ = tokio::signal::ctrl_c() => break,
             event = rx.recv() => {
                 let Some(event) = event else { break };
                 r.event(event, clock.elapsed().as_secs()).await;
             },
+            result = async {
+                match &mut r.pending {
+                    Some(pending) => (&mut pending.task).await.map_err(|e| format!("action task: {e}")).and_then(|r| r),
+                    None => std::future::pending().await,
+                }
+            } => r.finished(result, clock.elapsed().as_secs()),
             _ = tick.tick() => r.tick(clock.elapsed().as_secs()).await,
         }
     }
 
-    if r.blanked {
-        let _ = r.wake().await;
+    if let Some(pending) = r.pending.take() {
+        pending.task.abort();
+        let _ = pending.task.await;
+        // An interrupted display command may already have switched the outputs off.
+        r.blanked |= matches!(pending.work, Work::Action(Action::Display));
+    }
+    if r.blanked && !r.dry {
+        let _ = actions::output(&r.c.commands.display_on, 5).await;
     }
     drop(r.idle_hint_tx);
     let _ = idle_hint_task.await;
@@ -359,47 +446,8 @@ impl Runtime {
         self.input_idle = idle;
         if !idle {
             self.policy.activity(now);
+            self.cycle += 1;
         }
-    }
-    async fn restore_display(&mut self) {
-        match self.wake().await {
-            Ok(()) => {
-                self.health.remove("display");
-            }
-            Err(e) => {
-                self.health.insert("display".into(), e);
-            }
-        }
-    }
-    async fn control(&mut self, request: Request, now: u64) -> Result<String, String> {
-        let renewed = matches!(request, Request::SetToggle { .. }).then_some("manual:toggle");
-        let changes_manual = matches!(
-            request,
-            Request::Toggle
-                | Request::SetToggle { .. }
-                | Request::KeepAwake { .. }
-                | Request::Release { .. }
-                | Request::Automatic
-        );
-        let previous = changes_manual.then(|| self.manual.clone());
-        let result = self.control_inner(request, now).await;
-        if let Some(previous) = previous
-            && result.is_ok()
-        {
-            if let Some(store) = &self.manual_store
-                && let Err(error) = if renewed.is_some() {
-                    store.save_renewed(&self.manual, now, renewed)
-                } else {
-                    store.save(&self.manual, now)
-                }
-            {
-                self.manual = previous;
-                self.health.insert("manual-state".into(), error.clone());
-                return Err(error);
-            }
-            self.health.remove("manual-state");
-        }
-        result
     }
     fn explain(&mut self, action: Action, now: u64) -> String {
         let status = self.status(now);
@@ -423,7 +471,6 @@ impl Runtime {
                 "eligible in {}s ({})",
                 timer.remaining_seconds,
                 match timer.delay {
-                    Some(vigil_core::TimerDelay::ReleaseGrace) => "release grace",
                     Some(vigil_core::TimerDelay::Retry) => "retry delay",
                     None => "idle timeout",
                 }
@@ -438,14 +485,8 @@ impl Runtime {
             .iter()
             .filter(|i| i.scope.contains(&action))
         {
-            let expiry = status
-                .manual_inhibitors
-                .iter()
-                .find(|m| m.id == inhibitor.id)
-                .and_then(|m| m.remaining_seconds)
-                .map_or(String::new(), |n| format!(" ({n}s remaining)"));
             lines.push(format!(
-                "  {}: {}{expiry}",
+                "  {}: {}",
                 inhibitor.id,
                 inhibitor.reason.escape_default()
             ));
@@ -462,18 +503,21 @@ impl Runtime {
         }
         lines.join("\n")
     }
-    async fn control_inner(&mut self, request: Request, now: u64) -> Result<String, String> {
+    async fn control(&mut self, request: Request, now: u64) -> Result<String, String> {
         match request {
             Request::Status => Ok("status".into()),
             Request::Explain { action } => Ok(self.explain(action, now)),
             Request::Reload => {
                 let text = std::fs::read_to_string(&self.config_file).map_err(|e| e.to_string())?;
                 let next = Config::parse(&text)?;
-                if self.blanked {
-                    self.wake().await?;
+                if self.pending.is_some() || self.blanked {
+                    return Err(
+                        "Wait for the current action or wake displays before reloading".into(),
+                    );
                 }
                 self.c = next;
                 self.revision += 1;
+                self.cycle += 1;
                 self.policy.activity(now);
                 self.sensors.clear();
                 self.sensor_health.clear();
@@ -482,47 +526,27 @@ impl Runtime {
                     "Refreshing after configuration reload".into(),
                 );
                 self.config_tx.send_replace((self.revision, self.c.clone()));
-                Ok("Configuration reloaded; idle timers reset, manual inhibitors preserved".into())
+                Ok("Configuration reloaded; idle timers reset, keep-awake preserved".into())
             }
-            Request::SetToggle { seconds } => {
-                self.manual.set_toggle(now, seconds)?;
-                Ok("Manual keep-awake enabled".into())
+            Request::KeepAwake { seconds } => {
+                self.caffeine.set(now, seconds)?;
+                Ok("Keep awake enabled".into())
             }
             Request::Toggle => {
-                self.manual.expire(now);
-                if self.manual.toggle() {
-                    Ok("Toggle keep-awake enabled (manual:toggle)".into())
+                self.caffeine.toggle(now);
+                Ok(if self.caffeine.status(now).is_some() {
+                    "Keep awake enabled"
                 } else {
-                    Ok("Toggle keep-awake released; other inhibitors preserved".into())
+                    "Automatic idle handling"
                 }
-            }
-            Request::KeepAwake {
-                seconds,
-                scope,
-                reason,
-            } => {
-                self.manual.expire(now);
-                self.manual.add(now, seconds, scope, reason)
-            }
-            Request::Release { id } => {
-                self.manual.release(&id, now)?;
-                Ok(format!("Released {id}"))
+                .into())
             }
             Request::Automatic => {
-                self.manual.clear();
-                Ok("All manual inhibitors cleared".into())
+                self.caffeine.clear();
+                Ok("Automatic idle handling".into())
             }
-            Request::Lock => self
-                .action(Action::Lock)
-                .await
-                .map(|_| "Lock requested".into()),
-            Request::Suspend => self
-                .action(Action::Suspend)
-                .await
-                .map(|_| "Suspend requested".into()),
-            Request::Wake => {
-                self.policy.activity(now);
-                self.wake().await.map(|_| "Displays restored".into())
+            Request::Lock | Request::Suspend | Request::Wake => {
+                Err("Action must be dispatched through the event loop".into())
             }
         }
     }
@@ -531,9 +555,6 @@ impl Runtime {
             Event::IdleHint(value) => self.idle_hint = value,
             Event::InputIdle(idle) => {
                 self.input(idle, now);
-                if !idle && self.blanked {
-                    self.restore_display().await;
-                }
             }
             Event::EffectiveIdle(idle) => self.effective_idle = idle,
             Event::Health(name, error) => {
@@ -556,13 +577,36 @@ impl Runtime {
                 self.sleeping = preparing;
                 if !preparing {
                     self.policy.activity(now);
-                    self.restore_display().await;
+                    self.cycle += 1;
+                    self.wake_requested = true;
                 }
             }
             Event::LockRequested => {
-                let _ = self.action(Action::Lock).await;
+                self.lock_requested = true;
             }
             Event::Control(request, reply) => {
+                let work = match request {
+                    Request::Lock => Some(Work::Action(Action::Lock)),
+                    Request::Suspend => Some(Work::PrepareSuspend),
+                    Request::Wake => Some(Work::Wake),
+                    _ => None,
+                };
+                if let Some(work) = work {
+                    if self.pending.is_none() {
+                        if matches!(work, Work::Wake) {
+                            self.policy.activity(now);
+                            self.cycle += 1;
+                        }
+                        self.begin(work, false, Some(reply));
+                    } else {
+                        let _ = reply.send(Response {
+                            ok: false,
+                            message: "An action is already in progress".into(),
+                            status: Some(self.status(now)),
+                        });
+                    }
+                    return;
+                }
                 let result = self.control(request, now).await;
                 let status = self.status(now);
                 let _ = reply.send(Response {
@@ -604,32 +648,42 @@ impl Runtime {
         if self.sleeping {
             return;
         }
-        if self.blanked
-            && status
-                .timers
-                .iter()
-                .any(|t| t.action == Action::Display && t.blocked)
-        {
-            self.restore_display().await;
+        if self.pending.is_some() {
+            return;
         }
-        for t in status.timers {
-            if t.enabled && !t.blocked && !t.completed && t.remaining_seconds == 0 {
-                match self.action(t.action).await {
-                    Ok(()) => {
-                        self.policy.complete(t.action);
-                        if t.action == Action::Display {
-                            self.blanked = true;
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("action failed: {e}");
-                        self.policy.failed(t.action, now, &self.c);
-                    }
-                }
+        if self.lock_requested {
+            self.lock_requested = false;
+            self.begin(Work::Action(Action::Lock), false, None);
+            return;
+        }
+        if self.wake_requested
+            || (self.blanked
+                && (!self.input_idle
+                    || status
+                        .timers
+                        .iter()
+                        .any(|t| t.action == Action::Display && t.blocked)))
+        {
+            if now >= self.wake_retry_at {
+                self.begin(Work::Wake, false, None);
             }
+            return;
+        }
+        if let Some(timer) = status
+            .timers
+            .iter()
+            .find(|t| t.enabled && !t.blocked && !t.completed && t.remaining_seconds == 0)
+        {
+            let work = if timer.action == Action::Suspend {
+                Work::PrepareSuspend
+            } else {
+                Work::Action(timer.action)
+            };
+            self.begin(work, true, None);
         }
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -644,381 +698,192 @@ mod tests {
             sensors: vec![],
             health: BTreeMap::new(),
             sensor_health: BTreeMap::new(),
-            input_idle: false,
+            input_idle: true,
             effective_idle: true,
             sleeping: false,
             blanked: false,
-            manual: ManualInhibitors::default(),
-            manual_store: None,
+            caffeine: Caffeine::default(),
+            pending: None,
+            cycle: 0,
+            wake_retry_at: 0,
+            wake_requested: false,
+            lock_requested: false,
             last_action: None,
             idle_hint: None,
             idle_hint_tx: watch::channel(None).0,
         }
     }
-    #[tokio::test]
-    async fn explain_reports_scopes_grace_retry_and_health_without_actions() {
-        let mut r = runtime();
-        r.input_idle = true;
-        r.manual
-            .add(0, Some(5000), vec![Action::Suspend], "Backup".into())
-            .unwrap();
-        let message = r
-            .control(
-                Request::Explain {
-                    action: Action::Suspend,
-                },
-                2000,
-            )
-            .await
-            .unwrap();
-        assert!(message.contains("Suspend: inhibited"));
-        assert!(message.contains("Backup (3000s remaining)"));
-        assert!(!r.explain(Action::Display, 2000).contains("Backup"));
-        r.manual.clear();
-        assert!(
-            r.explain(Action::Suspend, 2001)
-                .contains("60s (release grace)")
-        );
-        r.policy.failed(Action::Display, 2001, &r.c);
-        assert!(
-            r.explain(Action::Display, 2001)
-                .contains("30s (retry delay)")
-        );
+    async fn finish(r: &mut Runtime, now: u64) {
+        let result = (&mut r.pending.as_mut().unwrap().task).await.unwrap();
+        r.finished(result, now);
+    }
+    fn only_suspend(r: &mut Runtime) {
+        r.c.timeouts.display_seconds = 0;
         r.c.timeouts.lock_seconds = 0;
-        assert!(r.explain(Action::Lock, 2001).contains("disabled"));
-        r.health.insert("test-backend".into(), "unavailable".into());
-        assert!(
-            r.explain(Action::Lock, 2001)
-                .contains("Warning: test-backend: unavailable")
-        );
-        r.policy.complete(Action::Display);
-        assert!(r.explain(Action::Display, 2100).contains("completed"));
-        r.sleeping = true;
-        assert!(
-            r.explain(Action::Display, 2100)
-                .contains("sleep preparation")
-        );
-        assert!(r.last_action.is_none());
     }
     #[tokio::test]
-    async fn persistent_commands_restore_and_failed_writes_roll_back() {
-        let dir = std::env::temp_dir().join(format!("vigil-runtime-state-{}", std::process::id()));
-        let path = dir.join("manual.json");
+    async fn caffeine_replaces_expires_and_preserves_playback() {
         let mut r = runtime();
-        // Fake action adapters: exercise real state I/O without desktop actions.
-        r.manual_store = Some(manual_store::Store::open(path.clone()).unwrap());
-        let id = r
-            .control(
-                Request::KeepAwake {
-                    seconds: None,
-                    scope: ACTIONS.to_vec(),
-                    reason: "Persistent".into(),
-                },
-                0,
-            )
+        r.control(Request::KeepAwake { seconds: Some(10) }, 2000)
             .await
             .unwrap();
-        let temp = path.with_extension(format!("{}.tmp", std::process::id()));
-        std::fs::create_dir(&temp).unwrap();
-        assert!(r.control(Request::Automatic, 1).await.is_err());
-        assert_eq!(r.status(1).manual_inhibitors[0].id, id);
-        assert!(r.health.contains_key("manual-state"));
-        std::fs::remove_dir(&temp).unwrap();
-        drop(r);
-        let mut r = runtime();
-        let store = manual_store::Store::open(path.clone()).unwrap();
-        r.manual = store.load(0).unwrap();
-        r.manual_store = Some(store);
-        assert_eq!(r.status(0).manual_inhibitors[0].id, id);
-        r.control(Request::Release { id }, 0).await.unwrap();
-        assert!(
-            r.manual_store
-                .as_ref()
-                .unwrap()
-                .load(0)
-                .unwrap()
-                .status(0)
-                .is_empty()
-        );
-        drop(r);
-        std::fs::remove_dir_all(dir).unwrap();
+        r.control(Request::KeepAwake { seconds: Some(30) }, 2005)
+            .await
+            .unwrap();
+        assert_eq!(r.status(2010).caffeine.unwrap().remaining_seconds, Some(25));
+        r.sensors.push(Inhibitor {
+            id: "audio".into(),
+            reason: "Playback".into(),
+            scope: ACTIONS.to_vec(),
+        });
+        assert!(r.status(2035).caffeine.is_none());
+        assert!(r.status(2035).timers.iter().all(|t| t.blocked));
+        r.control(Request::Automatic, 2036).await.unwrap();
+        assert_eq!(r.status(2036).inhibitors.len(), 1);
+        r.sensors.clear();
+        let status = r.status(2037);
+        assert_eq!(status.timers[0].remaining_seconds, 900);
+        assert_eq!(status.timers[2].remaining_seconds, 1800);
+        r.tick(2037).await;
+        assert!(r.pending.is_none());
     }
     #[tokio::test]
-    async fn timed_toggle_replaces_deadline_persists_and_preserves_other_requests() {
-        let dir = std::env::temp_dir().join(format!("vigil-timed-toggle-{}", std::process::id()));
+    async fn slow_lock_keeps_control_responsive_and_input_cancels_auto_suspend() {
         let mut r = runtime();
-        r.manual_store = Some(manual_store::Store::open(dir.join("manual.json")).unwrap());
-        r.control(
-            Request::KeepAwake {
-                seconds: None,
-                scope: vec![Action::Suspend],
-                reason: "Download".into(),
-            },
-            0,
-        )
-        .await
-        .unwrap();
-        r.control(
-            Request::SetToggle {
-                seconds: Some(1800),
-            },
-            0,
-        )
-        .await
-        .unwrap();
-        let restored = r.manual_store.as_ref().unwrap().load(0).unwrap();
-        assert!(
-            restored
-                .status(0)
-                .iter()
-                .find(|m| m.id == "manual:toggle")
-                .unwrap()
-                .remaining_seconds
-                .unwrap()
-                <= 1800
-        );
-        r.control(
-            Request::SetToggle {
-                seconds: Some(5400),
-            },
-            10,
-        )
-        .await
-        .unwrap();
-        let restored = r.manual_store.as_ref().unwrap().load(10).unwrap();
-        assert!(
-            restored
-                .status(10)
-                .iter()
-                .find(|m| m.id == "manual:toggle")
-                .unwrap()
-                .remaining_seconds
-                .unwrap()
-                > 5300
-        );
-        assert_eq!(restored.status(10).len(), 2);
-        assert!(
-            r.control(Request::SetToggle { seconds: Some(0) }, 10)
-                .await
-                .is_err()
-        );
-        r.control(Request::Toggle, 11).await.unwrap();
-        assert_eq!(r.status(11).manual_inhibitors.len(), 1);
-        assert_eq!(r.status(11).manual_inhibitors[0].reason, "Download");
-        r.control(Request::SetToggle { seconds: Some(1) }, 12)
-            .await
-            .unwrap();
-        assert_eq!(r.status(13).manual_inhibitors.len(), 1);
-        r.control(Request::SetToggle { seconds: Some(1) }, 14)
-            .await
-            .unwrap();
-        r.control(Request::Toggle, 15).await.unwrap();
-        assert!(
-            r.status(15)
-                .manual_inhibitors
-                .iter()
-                .any(|m| m.id == "manual:toggle" && m.remaining_seconds.is_none())
-        );
-        drop(r);
-        std::fs::remove_dir_all(dir).unwrap();
+        only_suspend(&mut r);
+        let (done, wait) = oneshot::channel();
+        r.pending = Some(Pending {
+            work: Work::PrepareSuspend,
+            automatic: true,
+            cycle: 0,
+            reply: None,
+            task: tokio::spawn(async move {
+                wait.await.unwrap();
+                Ok(())
+            }),
+        });
+        let (reply, response) = oneshot::channel();
+        r.event(Event::Control(Request::Status, reply), 2000).await;
+        assert!(response.await.unwrap().ok);
+        r.event(Event::InputIdle(false), 2001).await;
+        r.event(Event::InputIdle(true), 2002).await;
+        done.send(()).unwrap();
+        finish(&mut r, 2003).await;
+        assert!(r.pending.is_none());
+        r.tick(2003).await;
+        assert!(r.pending.is_none());
     }
     #[tokio::test]
-    async fn continuous_input_never_runs_idle_actions() {
+    async fn new_inhibitor_or_sleep_prevents_suspend_after_lock() {
+        for sleeping in [false, true] {
+            let mut r = runtime();
+            only_suspend(&mut r);
+            r.tick(2000).await;
+            assert!(matches!(
+                r.pending.as_ref().unwrap().work,
+                Work::PrepareSuspend
+            ));
+            if sleeping {
+                r.event(Event::Sleep(true), 2001).await;
+            } else {
+                r.control(Request::KeepAwake { seconds: None }, 2001)
+                    .await
+                    .unwrap();
+            }
+            finish(&mut r, 2002).await;
+            assert!(r.pending.is_none());
+        }
+    }
+    #[tokio::test]
+    async fn failed_lock_never_suspends_and_retries_from_completion_time() {
         let mut r = runtime();
-        r.tick(10000).await;
-        assert!(r.last_action.is_none());
-        r.input(true, 10001);
-        r.tick(10900).await;
+        only_suspend(&mut r);
+        r.tick(2000).await;
+        (&mut r.pending.as_mut().unwrap().task)
+            .await
+            .unwrap()
+            .unwrap();
+        r.finished(Err("locker failed".into()), 2010);
+        assert!(r.pending.is_none());
+        assert_eq!(r.status(2011).timers[2].remaining_seconds, 29);
+    }
+    #[tokio::test]
+    async fn suspend_requires_lock_completion_and_explicit_request_bypasses_caffeine() {
+        let mut r = runtime();
+        r.caffeine.set(0, None).unwrap();
+        let (reply, response) = oneshot::channel();
+        r.event(Event::Control(Request::Suspend, reply), 2000).await;
+        assert!(matches!(
+            r.pending.as_ref().unwrap().work,
+            Work::PrepareSuspend
+        ));
+        finish(&mut r, 2001).await;
+        assert!(matches!(
+            r.pending.as_ref().unwrap().work,
+            Work::Action(Action::Suspend)
+        ));
+        finish(&mut r, 2002).await;
+        assert!(response.await.unwrap().ok);
+    }
+    #[tokio::test]
+    async fn activity_during_blanking_restores_display_without_completing_new_cycle() {
+        let mut r = runtime();
+        r.tick(1000).await;
+        r.event(Event::InputIdle(false), 1001).await;
+        r.event(Event::InputIdle(true), 1002).await;
+        finish(&mut r, 1002).await;
         assert!(r.blanked);
-        r.event(Event::InputIdle(false), 10901).await;
+        r.tick(1002).await;
+        assert!(matches!(r.pending.as_ref().unwrap().work, Work::Wake));
+        finish(&mut r, 1003).await;
         assert!(!r.blanked);
-        assert_eq!(r.status(10901).idle_seconds, 0);
+        assert!(!r.status(1003).timers[0].completed);
     }
     #[tokio::test]
-    async fn manual_expiry_composes_with_audio_and_grace() {
+    async fn continuous_input_disconnect_and_resume_reset_idle() {
         let mut r = runtime();
-        r.input_idle = true;
-        r.control(
-            Request::KeepAwake {
-                reason: "Presentation".into(),
-                seconds: Some(10),
-                scope: ACTIONS.to_vec(),
-            },
-            2000,
-        )
-        .await
-        .unwrap();
-        r.sensors.push(Inhibitor {
-            id: "audio".into(),
-            reason: "audio".into(),
-            scope: vec![Action::Suspend],
-        });
-        assert!(r.status(2001).timers.iter().all(|t| t.blocked));
-        let s = r.status(2010);
-        assert_eq!(s.inhibitors.len(), 1);
-        assert_eq!(s.timers[0].remaining_seconds, 60);
-        assert!(s.timers[2].blocked);
-    }
-    #[tokio::test]
-    async fn independent_release_and_expiry_preserve_scopes_and_grace() {
-        let mut r = runtime();
-        r.input_idle = true;
-        let download = r
-            .control(
-                Request::KeepAwake {
-                    seconds: None,
-                    scope: vec![Action::Suspend],
-                    reason: "Download".into(),
-                },
-                2000,
-            )
-            .await
-            .unwrap();
-        let presentation = r
-            .control(
-                Request::KeepAwake {
-                    seconds: Some(10),
-                    scope: ACTIONS.to_vec(),
-                    reason: "Presentation".into(),
-                },
-                2000,
-            )
-            .await
-            .unwrap();
-        assert_ne!(download, presentation);
-        assert!(r.status(2001).timers.iter().all(|t| t.blocked));
-        let s = r.status(2010);
-        assert_eq!(s.manual_inhibitors.len(), 1);
-        assert_eq!(s.manual_inhibitors[0].id, download);
-        assert_eq!(s.timers[0].remaining_seconds, 60);
-        assert!(s.timers[2].blocked);
-        assert!(
-            r.control(Request::Release { id: presentation }, 2010)
-                .await
-                .is_err()
-        );
-        assert_eq!(r.status(2010).manual_inhibitors.len(), 1);
-        r.control(Request::Release { id: download }, 2011)
-            .await
-            .unwrap();
-        let s = r.status(2011);
-        assert!(s.manual_inhibitors.is_empty());
-        assert!(!s.timers[2].blocked);
-        assert_eq!(s.timers[2].remaining_seconds, 60);
-    }
-    #[tokio::test]
-    async fn targeted_release_and_clear_preserve_sensor_inhibitors() {
-        let mut r = runtime();
-        r.sensors.push(Inhibitor {
-            id: "audio".into(),
-            reason: "Audio".into(),
-            scope: vec![Action::Suspend],
-        });
-        let first = r
-            .manual
-            .add(0, None, ACTIONS.to_vec(), "First".into())
-            .unwrap();
-        let second = r
-            .manual
-            .add(0, None, ACTIONS.to_vec(), "Second".into())
-            .unwrap();
-        r.control(Request::Release { id: first.clone() }, 1)
-            .await
-            .unwrap();
-        assert_eq!(r.status(1).manual_inhibitors[0].id, second);
-        assert!(r.status(1).timers.iter().all(|t| t.blocked));
-        assert!(r.control(Request::Release { id: first }, 1).await.is_err());
-        assert!(
-            r.control(Request::Release { id: "audio".into() }, 1)
-                .await
-                .is_err()
-        );
-        r.control(Request::Automatic, 1).await.unwrap();
-        let s = r.status(1);
-        assert!(s.manual_inhibitors.is_empty());
-        assert_eq!(s.inhibitors.len(), 1);
-        assert_eq!(s.inhibitors[0].id, "audio");
-    }
-    #[tokio::test]
-    async fn disconnect_blocks_and_reconnect_resets_idle_baseline() {
-        let mut r = runtime();
-        r.input_idle = true;
+        r.input_idle = false;
+        r.tick(10000).await;
+        assert!(r.pending.is_none());
+        r.event(Event::InputIdle(true), 10001).await;
         r.event(
             Event::Health("wayland".into(), Some("disconnected".into())),
-            2000,
+            12000,
         )
         .await;
-        r.tick(2000).await;
-        assert!(r.last_action.is_none());
-        r.event(Event::InputIdle(false), 2001).await;
-        r.event(Event::Health("wayland".into(), None), 2001).await;
-        r.tick(2001).await;
-        assert!(r.last_action.is_none());
-        assert_eq!(r.status(2001).timers[0].remaining_seconds, 900);
-    }
-    #[tokio::test]
-    async fn resume_and_explicit_commands_ignore_inhibitors() {
-        let mut r = runtime();
+        r.tick(12000).await;
+        assert!(r.pending.is_none());
+        r.event(Event::InputIdle(false), 12001).await;
+        r.event(Event::Health("wayland".into(), None), 12001).await;
+        assert_eq!(r.status(12001).idle_seconds, 0);
         r.input_idle = true;
-        r.control(
-            Request::KeepAwake {
-                reason: "Download".into(),
-                seconds: None,
-                scope: ACTIONS.to_vec(),
-            },
-            0,
-        )
-        .await
-        .unwrap();
-        r.control(Request::Suspend, 2000).await.unwrap();
-        assert_eq!(r.last_action.as_deref(), Some("dry-run: would Suspend"));
-        r.event(Event::Sleep(true), 2001).await;
-        r.event(Event::Sleep(false), 3000).await;
-        assert!(!r.sleeping);
-        assert_eq!(r.status(3000).idle_seconds, 0);
-        assert_eq!(r.inhibitors(3000).len(), 1);
+        r.event(Event::Sleep(true), 12002).await;
+        r.event(Event::Sleep(false), 14000).await;
+        assert_eq!(r.status(14000).idle_seconds, 0);
+        r.tick(14000).await;
+        finish(&mut r, 14001).await;
+        assert!(!r.blanked);
     }
     #[tokio::test]
-    async fn toggle_preserves_independent_requests() {
+    async fn reload_preserves_caffeine_rejects_invalid_config_and_stale_observations() {
         let mut r = runtime();
-        r.manual
-            .add(0, None, vec![Action::Suspend], "Download".into())
-            .unwrap();
-        r.control(Request::Toggle, 3).await.unwrap();
-        assert_eq!(r.status(3).manual_inhibitors.len(), 2);
-        r.control(Request::Toggle, 3).await.unwrap();
-        let status = r.status(3);
-        assert_eq!(status.manual_inhibitors.len(), 1);
-        assert_eq!(status.manual_inhibitors[0].reason, "Download");
-    }
-    #[tokio::test]
-    async fn reload_rejects_invalid_config_and_preserves_manual_override() {
-        let mut r = runtime();
-        let path =
-            std::env::temp_dir().join(format!("vigil-reload-test-{}.toml", std::process::id()));
-        r.config_file = path.clone();
-        r.manual
-            .add(0, Some(5000), vec![Action::Suspend], "Download".into())
-            .unwrap();
-        std::fs::write(&path, "[timeouts]\nlock_seconds = 42").unwrap();
+        r.config_file =
+            std::env::temp_dir().join(format!("vigil-reload-{}.toml", std::process::id()));
+        r.caffeine.set(0, None).unwrap();
+        std::fs::write(&r.config_file, "[timeouts]\nlock_seconds = 42").unwrap();
         r.control(Request::Reload, 2000).await.unwrap();
         assert_eq!(r.c.timeouts.lock_seconds, 42);
-        assert_eq!(r.policy.elapsed(2000), 0);
-        assert_eq!(
-            r.status(2000).manual_inhibitors[0].remaining_seconds,
-            Some(3000)
-        );
-        assert!(r.status(2000).timers.iter().all(|t| t.blocked));
+        assert!(r.status(2000).caffeine.is_some());
         r.event(Event::Sensors(0, vec![], BTreeMap::new()), 2001)
             .await;
         assert!(r.health.contains_key("sensors"));
         r.event(Event::Sensors(1, vec![], BTreeMap::new()), 2002)
             .await;
         assert!(!r.health.contains_key("sensors"));
-        std::fs::write(&path, "invalid = true").unwrap();
+        std::fs::write(&r.config_file, "typo = true").unwrap();
         assert!(r.control(Request::Reload, 2003).await.is_err());
-        assert_eq!(r.revision, 1);
         assert_eq!(r.c.timeouts.lock_seconds, 42);
-        std::fs::remove_file(path).unwrap();
+        assert!(r.explain(Action::Lock, 2003).contains("inhibited"));
+        std::fs::remove_file(&r.config_file).unwrap();
     }
 }

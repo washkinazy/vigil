@@ -2,7 +2,6 @@
 display_seconds = 900
 lock_seconds = 1200
 suspend_seconds = 1800
-release_grace_seconds = 60
 retry_seconds = 30
 
 [activity]
@@ -13,10 +12,9 @@ recording = true
 media = true
 # Opt in to "geometry" on Niri: output-sized visible windows approximate fullscreen.
 fullscreen = "disabled"
-audio_scope = ["suspend"]
-recording_scope = ["suspend"]
+audio_scope = ["display", "lock", "suspend"]
+recording_scope = ["display", "lock", "suspend"]
 media_scope = ["display", "lock", "suspend"]
-ignore_audio = ["speech-dispatcher-dummy", "sd_dummy"]
 
 [commands]
 lock_unit = "wm-lock.service"
