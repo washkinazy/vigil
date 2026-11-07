@@ -144,18 +144,26 @@ scopes, backend warnings, and timers remain available through `vigilctl status`.
 
 ```json
 "custom/vigil": {
-  "exec": "$HOME/.local/bin/vigilctl waybar --watch",
+  "exec": "vigilctl waybar --watch",
   "return-type": "json",
   "restart-interval": 5,
   "format": "{text}",
-  "hide-empty-text": true,
+  "hide-empty-text": false,
+  "on-click": "vigilctl toggle",
   "tooltip": true
 }
 ```
 
-The indicator hides when automatic policy has no inhibitors. A disconnected
-daemon shows a warning. Existing Waybar `idle_inhibitor` buttons work through
-compositor inhibition; `vigilctl toggle` is also suitable for a keybinding.
+The button remains visible in automatic mode. Its CSS class is `automatic` when
+there are no inhibitors, `manual` when the dedicated keep-awake toggle is on,
+and `inhibited` when other requests or application activity inhibit actions.
+Manual mode uses a coffee icon; other inhibition uses an eye, and automatic mode
+uses an eye with a slash. The tooltip describes the next click and lists activity
+reasons. Turning the toggle off preserves other keep-awake requests and application
+inhibitors. A disconnected daemon shows a warning with the `error` class.
+
+Replace Waybar's `idle_inhibitor` module with `custom/vigil` to use this button.
+`vigilctl toggle` is also suitable for a keybinding.
 
 The socket is `$XDG_RUNTIME_DIR/vigil/control.sock`, inside a private directory.
 Both binaries accept `--socket PATH`; its existing parent must be private.
