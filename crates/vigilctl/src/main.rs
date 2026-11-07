@@ -33,6 +33,24 @@ fn waybar(s: &Status) -> serde_json::Value {
     } else {
         "Vigil".into()
     }];
+    let toggled = s.manual_inhibitors.iter().any(|i| i.id == "manual:toggle");
+    let (icon, class) = if toggled {
+        ("", "manual")
+    } else if !s.inhibitors.is_empty() {
+        ("", "inhibited")
+    } else {
+        ("", "automatic")
+    };
+    lines.push(if toggled {
+        "Keep-awake toggle: on".into()
+    } else {
+        "Keep-awake toggle: off".into()
+    });
+    lines.push(if toggled {
+        "Click to disable this toggle; other inhibitors remain active.".into()
+    } else {
+        "Click to keep awake (prevent automatic display blanking, locking, and suspend).".into()
+    });
     let mut reasons = std::collections::BTreeMap::new();
     for i in &s.inhibitors {
         if i.id == "compositor" {
@@ -70,7 +88,7 @@ fn waybar(s: &Status) -> serde_json::Value {
             ));
         }
     }
-    serde_json::json!({"text":if s.inhibitors.is_empty(){""}else{""},"class":if s.inhibitors.is_empty(){"automatic"}else{"inhibited"},"tooltip":markup(&lines.join("\n"))})
+    serde_json::json!({"text":icon,"class":class,"tooltip":markup(&lines.join("\n"))})
 }
 #[tokio::main]
 async fn main() {
@@ -223,6 +241,83 @@ async fn start() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn status() -> Status {
+        Status {
+            idle_hint: None,
+            dry_run: false,
+            idle_seconds: 0,
+            inhibitors: vec![],
+            timers: vec![],
+            health: Default::default(),
+            last_action: None,
+            manual_inhibitors: vec![],
+        }
+    }
+    #[test]
+    fn automatic_button_stays_visible_and_offers_keep_awake() {
+        let v = waybar(&status());
+        assert!(!v["text"].as_str().unwrap().is_empty());
+        assert_eq!(v["class"], "automatic");
+        assert!(
+            v["tooltip"]
+                .as_str()
+                .unwrap()
+                .contains("Click to keep awake")
+        );
+    }
+    #[test]
+    fn only_dedicated_toggle_marks_button_manual() {
+        let mut s = status();
+        s.inhibitors.push(vigil_core::Inhibitor {
+            id: "manual:1".into(),
+            reason: "Download".into(),
+            scope: vec![vigil_core::Action::Suspend],
+        });
+        s.manual_inhibitors.push(vigil_core::ManualStatus {
+            id: "manual:1".into(),
+            reason: "Download".into(),
+            scope: vec![vigil_core::Action::Suspend],
+            remaining_seconds: Some(90),
+        });
+        let v = waybar(&s);
+        assert_eq!(v["class"], "inhibited");
+        assert!(v["tooltip"].as_str().unwrap().contains("toggle: off"));
+        assert!(
+            v["tooltip"]
+                .as_str()
+                .unwrap()
+                .contains("Download: 2 min remaining")
+        );
+        s.manual_inhibitors.push(vigil_core::ManualStatus {
+            id: "manual:toggle".into(),
+            reason: "Toggle".into(),
+            scope: ACTIONS.to_vec(),
+            remaining_seconds: None,
+        });
+        let v = waybar(&s);
+        assert_eq!(v["class"], "manual");
+        assert!(
+            v["tooltip"]
+                .as_str()
+                .unwrap()
+                .contains("other inhibitors remain active")
+        );
+        s.manual_inhibitors.pop();
+        assert_eq!(waybar(&s)["class"], "inhibited");
+    }
+    #[test]
+    fn application_inhibition_does_not_claim_toggle_is_on() {
+        let mut s = status();
+        s.inhibitors.push(vigil_core::Inhibitor {
+            id: "compositor".into(),
+            reason: "Application".into(),
+            scope: ACTIONS.to_vec(),
+        });
+        let v = waybar(&s);
+        assert_eq!(v["class"], "inhibited");
+        assert!(v["tooltip"].as_str().unwrap().contains("toggle: off"));
+        assert!(v["tooltip"].as_str().unwrap().contains("An application"));
+    }
     #[test]
     fn tooltip_escapes_external_labels() {
         let s = Status {

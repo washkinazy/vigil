@@ -38,9 +38,11 @@ with tempfile.TemporaryDirectory(prefix="vigil-smoke-", dir=os.environ["XDG_RUNT
         time.sleep(3)
         assert [i["id"] for i in status()["manual_inhibitors"]] == [second]
         call("toggle")
+        assert json.loads(call("waybar"))["class"] == "manual"
         assert len(status()["manual_inhibitors"]) == 2
         call("toggle")
         assert [i["id"] for i in status()["manual_inhibitors"]] == [second]
+        assert json.loads(call("waybar"))["class"] == "inhibited"
         # Concurrent clients must each flip state exactly once, preserving other requests.
         toggles = [subprocess.Popen(ctl + ["toggle"], stdout=subprocess.DEVNULL) for _ in range(10)]
         assert all(p.wait(timeout=10) == 0 for p in toggles)
