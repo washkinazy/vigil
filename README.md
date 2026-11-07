@@ -119,11 +119,11 @@ spawn-at-startup "systemctl" "--user" "start" "vigil-tray.service"
 ```
 
 The tray service starts Vigil if needed. It requires a StatusNotifierItem host,
-such as Waybar's `tray` module. The indicator uses native D-Bus menus and embedded
-icons; no GTK or icon-font dependency is required.
+such as Waybar's `tray` module. The indicator uses a flat native D-Bus menu and embedded antialiased eye icons
+at 16, 22, 24, 32, and 48 pixels; no GTK or icon-font dependency is required.
 
 Left-click toggles automatic idle handling. Right-click provides **Enabled** and
-**Disable for → 30 / 60 / 90 minutes**. Enabled reflects the shared manual toggle;
+**Disable for 30 / 60 / 90 minutes**. Enabled reflects the shared manual toggle;
 application inhibitors and separate keep-awake requests still apply. A new timed
 selection replaces the toggle's previous deadline, and expiry restores Enabled.
 Enabling removes only that override. Explicit lock/suspend commands still work.
@@ -274,3 +274,7 @@ validation because it interrupts the desktop.
 policy execution; `vigilctl` renders the daemon's decisions. Host package selection
 belongs in the Fedora setup repository; user preferences/startup belong in chezmoi.
 Licensed under the [MIT license](LICENSE).
+
+Tray icon sources live in `assets/tray/*.svg`. To regenerate their embedded ARGB
+images, run `python3 scripts/render-tray-icons.py` with Inkscape and ImageMagick
+installed. These tools are not needed to build or run Vigil.

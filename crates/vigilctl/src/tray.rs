@@ -1,7 +1,7 @@
 //! StatusNotifierItem client. The daemon owns every timer and policy decision.
 use ksni::{
     TrayMethods,
-    menu::{CheckmarkItem, StandardItem, SubMenu},
+    menu::{CheckmarkItem, StandardItem},
 };
 use std::{path::PathBuf, time::Duration};
 use tokio::sync::mpsc;
@@ -62,7 +62,7 @@ impl ksni::Tray for Indicator {
         self.send(Request::Toggle);
     }
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
-        vec![icon(self.disabled(), self.status.is_none())]
+        icons(self.disabled(), self.status.is_none())
     }
     fn tool_tip(&self) -> ksni::ToolTip {
         ksni::ToolTip {
@@ -72,7 +72,7 @@ impl ksni::Tray for Indicator {
         }
     }
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
-        vec![
+        let mut menu = vec![
             CheckmarkItem {
                 label: "Enabled".into(),
                 checked: self.status.is_some() && !self.disabled(),
@@ -81,72 +81,68 @@ impl ksni::Tray for Indicator {
                 ..Default::default()
             }
             .into(),
-            SubMenu {
-                label: "Disable for".into(),
+            ksni::MenuItem::Separator,
+        ];
+        menu.extend([30, 60, 90].into_iter().map(|minutes| {
+            StandardItem {
+                label: format!("Disable for {minutes} minutes"),
                 enabled: self.available(),
-                submenu: [30, 60, 90]
-                    .into_iter()
-                    .map(|minutes| {
-                        StandardItem {
-                            label: format!("{minutes} minutes"),
-                            activate: Box::new(move |tray: &mut Self| {
-                                tray.send(Request::SetToggle {
-                                    seconds: Some(minutes * 60),
-                                })
-                            }),
-                            ..Default::default()
-                        }
-                        .into()
+                activate: Box::new(move |tray: &mut Self| {
+                    tray.send(Request::SetToggle {
+                        seconds: Some(minutes * 60),
                     })
-                    .collect(),
+                }),
                 ..Default::default()
             }
-            .into(),
-        ]
+            .into()
+        }));
+        menu
     }
 }
 
-// Embedded line-art avoids dependencies on an installed icon theme or font.
-fn icon(disabled: bool, unavailable: bool) -> ksni::Icon {
-    let rows: [u16; 16] = if unavailable {
-        [
-            0, 0x0180, 0x03c0, 0x0660, 0x0c30, 0x1998, 0x319c, 0x619e, 0x619e, 0xc183, 0xc003,
-            0xc183, 0xffff, 0, 0, 0,
-        ]
-    } else if disabled {
-        [
-            0, 0x1200, 0x0900, 0x1200, 0, 0x3ff8, 0x200e, 0x2009, 0x200e, 0x2008, 0x1010, 0x0fe0,
-            0, 0, 0x3ffc, 0,
-        ]
-    } else {
-        [
-            0, 0x07e0, 0x1818, 0x2004, 0x4182, 0x4182, 0x8181, 0x8181, 0x81f1, 0x8001, 0x4002,
-            0x4002, 0x2004, 0x1818, 0x07e0, 0,
-        ]
-    };
-    let rgb = if unavailable {
-        [235, 90, 90]
-    } else if disabled {
-        [235, 190, 95]
-    } else {
-        [216, 222, 233]
-    };
-    let mut data = Vec::with_capacity(16 * 16 * 4);
-    for row in rows {
-        for x in 0..16 {
-            let pixel = if row & (1 << (15 - x)) != 0 {
-                [255, rgb[0], rgb[1], rgb[2]]
-            } else {
-                [0, 0, 0, 0]
-            };
-            data.extend_from_slice(&pixel);
-        }
+// Pre-rendered SVGs provide antialiased icons at native panel sizes without runtime dependencies.
+fn icons(disabled: bool, unavailable: bool) -> Vec<ksni::Icon> {
+    macro_rules! images {
+        ($name:literal) => {
+            [
+                (
+                    16,
+                    include_bytes!(concat!("../../../assets/tray/", $name, "-16.argb")).as_slice(),
+                ),
+                (
+                    22,
+                    include_bytes!(concat!("../../../assets/tray/", $name, "-22.argb")).as_slice(),
+                ),
+                (
+                    24,
+                    include_bytes!(concat!("../../../assets/tray/", $name, "-24.argb")).as_slice(),
+                ),
+                (
+                    32,
+                    include_bytes!(concat!("../../../assets/tray/", $name, "-32.argb")).as_slice(),
+                ),
+                (
+                    48,
+                    include_bytes!(concat!("../../../assets/tray/", $name, "-48.argb")).as_slice(),
+                ),
+            ]
+        };
     }
-    ksni::Icon {
-        width: 16,
-        height: 16,
-        data,
-    }
+    let images = if unavailable {
+        images!("unavailable")
+    } else if disabled {
+        images!("disabled")
+    } else {
+        images!("enabled")
+    };
+    images
+        .into_iter()
+        .map(|(size, data)| ksni::Icon {
+            width: size,
+            height: size,
+            data: data.to_vec(),
+        })
+        .collect()
 }
 
 pub async fn run(path: PathBuf) -> Result<(), String> {
@@ -223,10 +219,12 @@ mod tests {
         assert!(!tray.disabled());
         tray.pending = false;
         let menu = tray.menu();
-        let ksni::MenuItem::SubMenu(submenu) = &menu[1] else {
-            panic!("missing duration submenu")
-        };
-        for (item, seconds) in submenu.submenu.iter().zip([1800, 3600, 5400]) {
+        assert!(
+            !menu
+                .iter()
+                .any(|item| matches!(item, ksni::MenuItem::SubMenu(_)))
+        );
+        for (item, seconds) in menu[2..].iter().zip([1800, 3600, 5400]) {
             tray.pending = false;
             let ksni::MenuItem::Standard(item) = item else {
                 panic!("missing duration")
@@ -235,6 +233,27 @@ mod tests {
             assert!(
                 matches!(received.recv().await, Some(Request::SetToggle { seconds: Some(n) }) if n == seconds)
             );
+        }
+    }
+    #[test]
+    fn icons_have_native_sizes_and_antialiased_edges() {
+        for (disabled, unavailable) in [(false, false), (true, false), (false, true)] {
+            let icons = icons(disabled, unavailable);
+            assert_eq!(
+                icons.iter().map(|i| i.width).collect::<Vec<_>>(),
+                [16, 22, 24, 32, 48]
+            );
+            for icon in icons {
+                assert_eq!(icon.width, icon.height);
+                assert_eq!(icon.data.len(), (icon.width * icon.height * 4) as usize);
+                assert!(
+                    icon.data
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .any(|p| p[0] > 0 && p[0] < 255)
+                );
+            }
         }
     }
     #[test]
