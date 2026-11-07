@@ -33,29 +33,36 @@ fn waybar(s: &Status) -> serde_json::Value {
     } else {
         "Vigil".into()
     }];
+    let mut reasons = std::collections::BTreeMap::new();
     for i in &s.inhibitors {
-        lines.push(format!("{} — {:?}", i.reason, i.scope));
+        if i.id == "compositor" {
+            continue;
+        }
+        let reason = if let Some(app) = i
+            .reason
+            .strip_prefix("Playback: ")
+            .or_else(|| i.reason.strip_prefix("Media playing: "))
+        {
+            format!("Media: {app}")
+        } else if let Some(app) = i.reason.strip_prefix("Fullscreen geometry: ") {
+            format!("Fullscreen: {app}")
+        } else {
+            i.reason.clone()
+        };
+        reasons.entry(reason.to_lowercase()).or_insert(reason);
+    }
+    if reasons.is_empty() && s.inhibitors.iter().any(|i| i.id == "compositor") {
+        reasons.insert(
+            "application".into(),
+            "An application is keeping the session awake".into(),
+        );
+    }
+    lines.extend(reasons.values().take(4).cloned());
+    if reasons.len() > 4 {
+        lines.push(format!("And {} more", reasons.len() - 4));
     }
     if let Some(n) = s.manual_remaining_seconds {
-        lines.push(format!("Manual override expires in {n}s"));
-    }
-    for (name, error) in &s.health {
-        lines.push(format!("{name}: {error}"));
-    }
-    for t in &s.timers {
-        lines.push(format!(
-            "{:?}: {}",
-            t.action,
-            if !t.enabled {
-                "disabled".into()
-            } else if t.blocked {
-                "inhibited".into()
-            } else if t.completed {
-                "completed".into()
-            } else {
-                format!("{}s remaining", t.remaining_seconds)
-            }
-        ));
+        lines.push(format!("Keep-awake: {} min remaining", n.div_ceil(60)));
     }
     serde_json::json!({"text":if s.inhibitors.is_empty(){""}else{""},"class":if s.inhibitors.is_empty(){"automatic"}else{"inhibited"},"tooltip":markup(&lines.join("\n"))})
 }

@@ -109,7 +109,8 @@ vigilctl waybar --watch
 ```
 
 The Waybar output is newline-delimited JSON with escaped tooltips containing the
-actual inhibitor reasons, scopes, backend warnings, and timer states. Example:
+a compact list of activity reasons. Duplicate media sources are combined; detailed
+scopes, backend warnings, and timers remain available through `vigilctl status`. Example:
 
 ```json
 "custom/vigil": {
