@@ -361,6 +361,8 @@ impl ManualInhibitors {
                 || saved.reason.len() > 256
                 || saved.reason.chars().any(char::is_control)
                 || (saved.id == "manual:toggle" && (saved.scope != ACTIONS))
+                || (saved.id == "manual:toggle"
+                    && (saved.expires_at.is_some() || saved.scope != ACTIONS))
             {
                 return Err("invalid saved manual inhibitor".into());
             }
