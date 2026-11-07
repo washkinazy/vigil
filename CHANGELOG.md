@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/washkinazy/vigil/compare/v0.3.1...v0.4.0) (2026-11-07)
+
+
+### Features
+
+* persist manual inhibitors and explain idle decisions ([#9](https://github.com/washkinazy/vigil/issues/9)) ([e58b8c6](https://github.com/washkinazy/vigil/commit/e58b8c673107e3a3a06c93c777715dbf49064f9d))
+
 ## [0.3.1](https://github.com/washkinazy/vigil/compare/v0.3.0...v0.3.1) (2026-11-07)
 
 
