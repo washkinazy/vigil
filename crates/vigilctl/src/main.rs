@@ -61,8 +61,14 @@ fn waybar(s: &Status) -> serde_json::Value {
     if reasons.len() > 4 {
         lines.push(format!("And {} more", reasons.len() - 4));
     }
-    if let Some(n) = s.manual_remaining_seconds {
-        lines.push(format!("Keep-awake: {} min remaining", n.div_ceil(60)));
+    for manual in &s.manual_inhibitors {
+        if let Some(n) = manual.remaining_seconds {
+            lines.push(format!(
+                "{}: {} min remaining",
+                manual.reason,
+                n.div_ceil(60)
+            ));
+        }
     }
     serde_json::json!({"text":if s.inhibitors.is_empty(){""}else{""},"class":if s.inhibitors.is_empty(){"automatic"}else{"inhibited"},"tooltip":markup(&lines.join("\n"))})
 }
@@ -85,7 +91,7 @@ async fn start() -> Result<(), String> {
     }
     if args == ["--help"] || args == ["-h"] {
         println!(
-            "vigilctl [--socket PATH] COMMAND\n\nstatus [--json]\nwaybar [--watch]\nkeep-awake [DURATION] [--scope display,lock,suspend]\nautomatic\ntoggle\nreload\nlock\nsuspend\nwake\n\nDurations: 30s, 20m, 1h, 1d. Omitted duration lasts until automatic or restart.\nExplicit lock/suspend commands bypass activity inhibitors; suspend requires confirmed lock."
+            "vigilctl [--socket PATH] COMMAND\n\nstatus [--json]\nwaybar [--watch]\nkeep-awake [DURATION] [--scope display,lock,suspend] [--reason TEXT]\nrelease ID\nautomatic\ntoggle\nreload\nlock\nsuspend\nwake\n\nDurations: 30s, 20m, 1h, 1d. Each keep-awake prints its ID. Omitted duration lasts until released or restart.\nrelease removes one request; automatic clears all manual requests.\ntoggle controls its own all-action request and preserves other requests.\nExplicit lock/suspend commands bypass activity inhibitors; suspend requires confirmed lock."
         );
         return Ok(());
     }
@@ -106,6 +112,9 @@ async fn start() -> Result<(), String> {
             Request::Status
         }
         "automatic" if args.len() == 1 => Request::Automatic,
+        "release" if args.len() == 2 => Request::Release {
+            id: args[1].clone(),
+        },
         "lock" if args.len() == 1 => Request::Lock,
         "suspend" if args.len() == 1 => Request::Suspend,
         "wake" if args.len() == 1 => Request::Wake,
@@ -114,6 +123,7 @@ async fn start() -> Result<(), String> {
         "keep-awake" => {
             let mut seconds = None;
             let mut scope = ACTIONS.to_vec();
+            let mut reason = "Manual keep-awake".to_string();
             let mut tail = args.iter().skip(1);
             while let Some(arg) = tail.next() {
                 if arg == "--scope" {
@@ -128,13 +138,19 @@ async fn start() -> Result<(), String> {
                             _ => Err("scope must contain display,lock,suspend"),
                         })
                         .collect::<Result<Vec<_>, _>>()?;
+                } else if arg == "--reason" {
+                    reason = tail.next().ok_or("--reason requires text")?.clone();
                 } else if seconds.is_none() {
                     seconds = Some(duration(arg)?);
                 } else {
                     return Err("unexpected argument".into());
                 }
             }
-            Request::KeepAwake { seconds, scope }
+            Request::KeepAwake {
+                seconds,
+                scope,
+                reason,
+            }
         }
         _ => return Err("unsupported command or arguments; see --help".into()),
     };
@@ -176,7 +192,17 @@ async fn start() -> Result<(), String> {
                     s.idle_seconds
                 );
                 for i in &s.inhibitors {
-                    println!("  {} [{:?}]", i.reason, i.scope);
+                    println!("  {}: {} [{:?}]", i.id, i.reason, i.scope);
+                }
+                for manual in &s.manual_inhibitors {
+                    println!(
+                        "  {}: {}",
+                        manual.id,
+                        manual.remaining_seconds.map_or_else(
+                            || "until released or restart".into(),
+                            |n| format!("{n}s remaining")
+                        )
+                    );
                 }
                 for t in &s.timers {
                     println!(
@@ -211,7 +237,7 @@ mod tests {
             timers: vec![],
             health: Default::default(),
             last_action: None,
-            manual_remaining_seconds: None,
+            manual_inhibitors: vec![],
         };
         let v = waybar(&s);
         assert!(

@@ -16,7 +16,9 @@ use tokio::{
     sync::{mpsc, oneshot, watch},
     time::{Instant, timeout},
 };
-use vigil_core::{ACTIONS, Action, Config, Inhibitor, Policy, Request, Response, Status};
+use vigil_core::{
+    ACTIONS, Action, Config, Inhibitor, ManualInhibitors, Policy, Request, Response, Status,
+};
 
 pub enum Event {
     IdleHint(Option<bool>),
@@ -42,21 +44,14 @@ struct Runtime {
     effective_idle: bool,
     sleeping: bool,
     blanked: bool,
-    manual: Option<(Option<u64>, Vec<Action>)>,
+    manual: ManualInhibitors,
     last_action: Option<String>,
     idle_hint: Option<bool>,
     idle_hint_tx: watch::Sender<Option<bool>>,
 }
 impl Runtime {
     fn inhibitors(&mut self, now: u64) -> Vec<Inhibitor> {
-        if self
-            .manual
-            .as_ref()
-            .and_then(|m| m.0)
-            .is_some_and(|until| now >= until)
-        {
-            self.manual = None;
-        }
+        self.manual.expire(now);
         let mut list = self.sensors.clone();
         if self.input_idle && !self.effective_idle {
             list.push(Inhibitor {
@@ -72,11 +67,11 @@ impl Runtime {
                 scope: ACTIONS.to_vec(),
             });
         }
-        if let Some((_, scope)) = &self.manual {
+        for manual in self.manual.status(now) {
             list.push(Inhibitor {
-                id: "manual".into(),
-                reason: "Manual keep-awake".into(),
-                scope: scope.clone(),
+                id: manual.id,
+                reason: manual.reason,
+                scope: manual.scope,
             });
         }
         list
@@ -94,11 +89,7 @@ impl Runtime {
             timers,
             health,
             last_action: self.last_action.clone(),
-            manual_remaining_seconds: self
-                .manual
-                .as_ref()
-                .and_then(|m| m.0)
-                .map(|until| until.saturating_sub(now)),
+            manual_inhibitors: self.manual.status(now),
         }
     }
     async fn action(&mut self, a: Action) -> Result<(), String> {
@@ -301,7 +292,7 @@ async fn start() -> Result<(), String> {
         effective_idle: false,
         sleeping: false,
         blanked: false,
-        manual: None,
+        manual: ManualInhibitors::default(),
         last_action: None,
         idle_hint: None,
         idle_hint_tx,
@@ -374,27 +365,30 @@ impl Runtime {
                     "Refreshing after configuration reload".into(),
                 );
                 self.config_tx.send_replace((self.revision, self.c.clone()));
-                Ok("Configuration reloaded; idle timers reset, manual override preserved".into())
+                Ok("Configuration reloaded; idle timers reset, manual inhibitors preserved".into())
             }
             Request::Toggle => {
-                self.inhibitors(now);
-                if self.manual.take().is_some() {
-                    Ok("Automatic policy restored".into())
+                if self.manual.toggle() {
+                    Ok("Toggle keep-awake enabled (manual:toggle)".into())
                 } else {
-                    self.manual = Some((None, ACTIONS.to_vec()));
-                    Ok("Manual keep-awake enabled".into())
+                    Ok("Toggle keep-awake released; other inhibitors preserved".into())
                 }
             }
-            Request::KeepAwake { seconds, scope } => {
-                if scope.is_empty() || seconds == Some(0) {
-                    return Err("scope and duration must be nonempty/positive".into());
-                }
-                self.manual = Some((seconds.map(|s| now.saturating_add(s)), scope));
-                Ok("Manual keep-awake enabled".into())
+            Request::KeepAwake {
+                seconds,
+                scope,
+                reason,
+            } => {
+                self.manual.expire(now);
+                self.manual.add(now, seconds, scope, reason)
+            }
+            Request::Release { id } => {
+                self.manual.release(&id, now)?;
+                Ok(format!("Released {id}"))
             }
             Request::Automatic => {
-                self.manual = None;
-                Ok("Automatic policy restored".into())
+                self.manual.clear();
+                Ok("All manual inhibitors cleared".into())
             }
             Request::Lock => self
                 .action(Action::Lock)
@@ -532,7 +526,7 @@ mod tests {
             effective_idle: true,
             sleeping: false,
             blanked: false,
-            manual: None,
+            manual: ManualInhibitors::default(),
             last_action: None,
             idle_hint: None,
             idle_hint_tx: watch::channel(None).0,
@@ -556,6 +550,7 @@ mod tests {
         r.input_idle = true;
         r.control(
             Request::KeepAwake {
+                reason: "Presentation".into(),
                 seconds: Some(10),
                 scope: ACTIONS.to_vec(),
             },
@@ -573,6 +568,86 @@ mod tests {
         assert_eq!(s.inhibitors.len(), 1);
         assert_eq!(s.timers[0].remaining_seconds, 60);
         assert!(s.timers[2].blocked);
+    }
+    #[tokio::test]
+    async fn independent_release_and_expiry_preserve_scopes_and_grace() {
+        let mut r = runtime();
+        r.input_idle = true;
+        let download = r
+            .control(
+                Request::KeepAwake {
+                    seconds: None,
+                    scope: vec![Action::Suspend],
+                    reason: "Download".into(),
+                },
+                2000,
+            )
+            .await
+            .unwrap();
+        let presentation = r
+            .control(
+                Request::KeepAwake {
+                    seconds: Some(10),
+                    scope: ACTIONS.to_vec(),
+                    reason: "Presentation".into(),
+                },
+                2000,
+            )
+            .await
+            .unwrap();
+        assert_ne!(download, presentation);
+        assert!(r.status(2001).timers.iter().all(|t| t.blocked));
+        let s = r.status(2010);
+        assert_eq!(s.manual_inhibitors.len(), 1);
+        assert_eq!(s.manual_inhibitors[0].id, download);
+        assert_eq!(s.timers[0].remaining_seconds, 60);
+        assert!(s.timers[2].blocked);
+        assert!(
+            r.control(Request::Release { id: presentation }, 2010)
+                .await
+                .is_err()
+        );
+        assert_eq!(r.status(2010).manual_inhibitors.len(), 1);
+        r.control(Request::Release { id: download }, 2011)
+            .await
+            .unwrap();
+        let s = r.status(2011);
+        assert!(s.manual_inhibitors.is_empty());
+        assert!(!s.timers[2].blocked);
+        assert_eq!(s.timers[2].remaining_seconds, 60);
+    }
+    #[tokio::test]
+    async fn targeted_release_and_clear_preserve_sensor_inhibitors() {
+        let mut r = runtime();
+        r.sensors.push(Inhibitor {
+            id: "audio".into(),
+            reason: "Audio".into(),
+            scope: vec![Action::Suspend],
+        });
+        let first = r
+            .manual
+            .add(0, None, ACTIONS.to_vec(), "First".into())
+            .unwrap();
+        let second = r
+            .manual
+            .add(0, None, ACTIONS.to_vec(), "Second".into())
+            .unwrap();
+        r.control(Request::Release { id: first.clone() }, 1)
+            .await
+            .unwrap();
+        assert_eq!(r.status(1).manual_inhibitors[0].id, second);
+        assert!(r.status(1).timers.iter().all(|t| t.blocked));
+        assert!(r.control(Request::Release { id: first }, 1).await.is_err());
+        assert!(
+            r.control(Request::Release { id: "audio".into() }, 1)
+                .await
+                .is_err()
+        );
+        r.control(Request::Automatic, 1).await.unwrap();
+        let s = r.status(1);
+        assert!(s.manual_inhibitors.is_empty());
+        assert_eq!(s.inhibitors.len(), 1);
+        assert_eq!(s.inhibitors[0].id, "audio");
     }
     #[tokio::test]
     async fn disconnect_blocks_and_reconnect_resets_idle_baseline() {
@@ -597,6 +672,7 @@ mod tests {
         r.input_idle = true;
         r.control(
             Request::KeepAwake {
+                reason: "Download".into(),
                 seconds: None,
                 scope: ACTIONS.to_vec(),
             },
@@ -613,13 +689,17 @@ mod tests {
         assert_eq!(r.inhibitors(3000).len(), 1);
     }
     #[tokio::test]
-    async fn toggle_expires_old_override_before_deciding() {
+    async fn toggle_preserves_independent_requests() {
         let mut r = runtime();
-        r.manual = Some((Some(2), vec![Action::Suspend]));
+        r.manual
+            .add(0, None, vec![Action::Suspend], "Download".into())
+            .unwrap();
         r.control(Request::Toggle, 3).await.unwrap();
-        assert_eq!(r.manual, Some((None, ACTIONS.to_vec())));
+        assert_eq!(r.status(3).manual_inhibitors.len(), 2);
         r.control(Request::Toggle, 3).await.unwrap();
-        assert!(r.manual.is_none());
+        let status = r.status(3);
+        assert_eq!(status.manual_inhibitors.len(), 1);
+        assert_eq!(status.manual_inhibitors[0].reason, "Download");
     }
     #[tokio::test]
     async fn reload_rejects_invalid_config_and_preserves_manual_override() {
@@ -627,12 +707,17 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("vigil-reload-test-{}.toml", std::process::id()));
         r.config_file = path.clone();
-        r.manual = Some((Some(5000), vec![Action::Suspend]));
+        r.manual
+            .add(0, Some(5000), vec![Action::Suspend], "Download".into())
+            .unwrap();
         std::fs::write(&path, "[timeouts]\nlock_seconds = 42").unwrap();
         r.control(Request::Reload, 2000).await.unwrap();
         assert_eq!(r.c.timeouts.lock_seconds, 42);
         assert_eq!(r.policy.elapsed(2000), 0);
-        assert_eq!(r.manual, Some((Some(5000), vec![Action::Suspend])));
+        assert_eq!(
+            r.status(2000).manual_inhibitors[0].remaining_seconds,
+            Some(3000)
+        );
         assert!(r.status(2000).timers.iter().all(|t| t.blocked));
         r.event(Event::Sensors(0, vec![], BTreeMap::new()), 2001)
             .await;

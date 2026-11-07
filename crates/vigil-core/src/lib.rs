@@ -247,6 +247,84 @@ impl Policy {
     }
 }
 
+/// Process-local manual inhibitors, with deadlines on the daemon's monotonic clock.
+#[derive(Debug, Default)]
+pub struct ManualInhibitors {
+    next_id: u64,
+    entries: BTreeMap<String, (Option<u64>, String, Vec<Action>)>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManualStatus {
+    pub id: String,
+    pub reason: String,
+    pub scope: Vec<Action>,
+    pub remaining_seconds: Option<u64>,
+}
+impl ManualInhibitors {
+    pub fn expire(&mut self, now: u64) {
+        self.entries
+            .retain(|_, (until, _, _)| until.is_none_or(|until| now < until));
+    }
+    pub fn add(
+        &mut self,
+        now: u64,
+        seconds: Option<u64>,
+        scope: Vec<Action>,
+        reason: String,
+    ) -> Result<String, String> {
+        if scope.is_empty() || seconds == Some(0) {
+            return Err("scope and duration must be nonempty/positive".into());
+        }
+        if reason.trim().is_empty() || reason.len() > 256 || reason.chars().any(char::is_control) {
+            return Err("reason must be 1–256 bytes with no control characters".into());
+        }
+        let until = seconds
+            .map(|s| now.checked_add(s).ok_or("duration is too large"))
+            .transpose()?;
+        let next = self
+            .next_id
+            .checked_add(1)
+            .ok_or("manual inhibitor IDs exhausted")?;
+        self.next_id = next;
+        let id = format!("manual:{next}");
+        self.entries.insert(id.clone(), (until, reason, scope));
+        Ok(id)
+    }
+    pub fn release(&mut self, id: &str, now: u64) -> Result<(), String> {
+        self.expire(now);
+        self.entries
+            .remove(id)
+            .map(|_| ())
+            .ok_or_else(|| format!("No active manual inhibitor: {id}"))
+    }
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+    pub fn toggle(&mut self) -> bool {
+        if self.entries.remove("manual:toggle").is_some() {
+            false
+        } else {
+            self.entries.insert(
+                "manual:toggle".into(),
+                (None, "Manual keep-awake (toggle)".into(), ACTIONS.to_vec()),
+            );
+            true
+        }
+    }
+    pub fn status(&self, now: u64) -> Vec<ManualStatus> {
+        self.entries
+            .iter()
+            .filter(|(_, (until, _, _))| until.is_none_or(|until| now < until))
+            .map(|(id, (until, reason, scope))| ManualStatus {
+                id: id.clone(),
+                reason: reason.clone(),
+                scope: scope.clone(),
+                remaining_seconds: until.map(|until| until.saturating_sub(now)),
+            })
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Request {
@@ -254,6 +332,11 @@ pub enum Request {
     KeepAwake {
         seconds: Option<u64>,
         scope: Vec<Action>,
+        #[serde(default = "default_manual_reason")]
+        reason: String,
+    },
+    Release {
+        id: String,
     },
     Automatic,
     Toggle,
@@ -271,13 +354,17 @@ pub struct Status {
     pub timers: Vec<Timer>,
     pub health: BTreeMap<String, String>,
     pub last_action: Option<String>,
-    pub manual_remaining_seconds: Option<u64>,
+    pub manual_inhibitors: Vec<ManualStatus>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Response {
     pub ok: bool,
     pub message: String,
     pub status: Option<Status>,
+}
+
+fn default_manual_reason() -> String {
+    "Manual keep-awake".into()
 }
 
 pub fn duration(value: &str) -> Result<u64, String> {
@@ -380,5 +467,39 @@ mod idle_hint_tests {
         assert_eq!(c.idle_hint(60, false, false), Some(false));
         assert_eq!(c.idle_hint(60, true, true), Some(false));
         assert_eq!(c.idle_hint(0, true, false), Some(false));
+    }
+}
+
+#[cfg(test)]
+mod manual_tests {
+    use super::*;
+    #[test]
+    fn rejects_invalid_requests_without_replacing_existing_state() {
+        let mut m = ManualInhibitors::default();
+        let id = m
+            .add(10, Some(20), vec![Action::Suspend], "Download".into())
+            .unwrap();
+        for reason in [
+            "".to_string(),
+            "  ".into(),
+            "bad\nlabel".into(),
+            "x".repeat(257),
+        ] {
+            assert!(m.add(10, None, ACTIONS.to_vec(), reason).is_err());
+        }
+        assert!(m.add(10, Some(0), ACTIONS.to_vec(), "Zero".into()).is_err());
+        assert!(m.add(10, None, vec![], "Empty".into()).is_err());
+        assert!(
+            m.add(10, Some(u64::MAX), ACTIONS.to_vec(), "Overflow".into())
+                .is_err()
+        );
+        let status = m.status(15);
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].id, id);
+        assert_eq!(status[0].remaining_seconds, Some(15));
+        m.expire(30);
+        assert!(m.status(30).is_empty());
+        let next = m.add(30, None, ACTIONS.to_vec(), "Next".into()).unwrap();
+        assert_ne!(next, id);
     }
 }
