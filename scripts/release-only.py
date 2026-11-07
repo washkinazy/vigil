@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Identify release metadata changes; any other change requires the full matrix."""
+"""Select full builds conservatively, excluding documentation and CI-only changes."""
 
 import json
 import re
@@ -20,7 +20,11 @@ def normalized(path, text):
     if path == "Cargo.lock":
         data = tomllib.loads(text)
         for package in data["package"]:
-            if "source" not in package and package["name"] in {"vigil-core", "vigild", "vigilctl"}:
+            if "source" not in package and package["name"] in {
+                "vigil-core",
+                "vigild",
+                "vigilctl",
+            }:
                 package.pop("version")
         return data
     if path == "packaging/vigil.spec":
@@ -32,12 +36,26 @@ def normalized(path, text):
     return None
 
 
+def changed_paths(base, head):
+    return (
+        subprocess.check_output(
+            ["git", "diff", "--no-renames", "--name-only", "-z", base, head], text=True
+        )
+        .rstrip("\0")
+        .split("\0")
+    )
+
+
 def release_only(base, head):
-    paths = subprocess.check_output(
-        ["git", "diff", "--name-only", base, head], text=True
-    ).splitlines()
-    allowed = {"VERSION", "CHANGELOG.md", "Cargo.toml", "Cargo.lock",
-               "packaging/vigil.spec", ".release-please-manifest.json"}
+    paths = changed_paths(base, head)
+    allowed = {
+        "VERSION",
+        "CHANGELOG.md",
+        "Cargo.toml",
+        "Cargo.lock",
+        "packaging/vigil.spec",
+        ".release-please-manifest.json",
+    }
     if not paths or not set(paths) <= allowed:
         return False
     for path in paths:
@@ -47,9 +65,35 @@ def release_only(base, head):
     return True
 
 
+def requires_build(base, head, release_pr=False):
+    # Compare the PR's own changes, not unrelated commits added to main.
+    base = subprocess.check_output(["git", "merge-base", base, head], text=True).strip()
+    if release_pr and release_only(base, head):
+        return False
+    ci_files = {
+        "scripts/release-only.py",
+        "scripts/test-ci-selection.py",
+        "scripts/check-version.py",
+        "scripts/test-release.cjs",
+        "release-please-config.json",
+        ".release-please-manifest.json",
+    }
+    for path in changed_paths(base, head):
+        if (
+            path.endswith(".md")
+            or path.startswith(("docs/", ".github/"))
+            or path in ci_files
+        ):
+            continue
+        return True
+    return False
+
+
 if __name__ == "__main__":
     try:
-        result = release_only(*sys.argv[1:])
+        result = requires_build(
+            sys.argv[1], sys.argv[2], "--release-pr" in sys.argv[3:]
+        )
     except (KeyError, ValueError, subprocess.CalledProcessError):
-        result = False
+        result = True
     print("true" if result else "false")

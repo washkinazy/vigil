@@ -32,7 +32,10 @@ does not republish or increment it on installation.
 3. Merge the automation PR. Use squash merges with Conventional Commit titles,
    and require the CI checks before merging PRs. Generated release PRs run version
    and release-config validation; their Fedora matrix is skipped only when the
-   diff contains release metadata alone. Feature PRs run the full Fedora matrix.
+   diff contains release metadata alone. CI-only and documentation-only PRs also
+   skip the Fedora matrix. Rust, dependency, packaging, build/install script, and
+   unrecognized changes run the full matrix. Workflow validation and CI-selection
+   tests run on every PR, alongside release validation.
    Checks run on PRs and manual dispatch, not again on pushes to `main`.
 
 No per-release changes to COPR's Committish or spec settings are required.
