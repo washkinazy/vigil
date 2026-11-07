@@ -73,6 +73,7 @@ def requires_build(base, head, release_pr=False):
     ci_files = {
         "scripts/release-only.py",
         "scripts/test-ci-selection.py",
+        "scripts/auto-merge-release.py",
         "scripts/check-version.py",
         "scripts/test-release.cjs",
         "release-please-config.json",

@@ -89,3 +89,26 @@ jobs:
             python3 scripts/check-version.py
             NODE_PATH=/tmp/release-tools/node_modules node scripts/test-release.cjs
           '
+  ci:
+    name: CI
+    if: always()
+    needs: [classify, workflow-validation, check, release-config]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all applicable checks
+        env:
+          CLASSIFY: ${{ needs.classify.result }}
+          WORKFLOWS: ${{ needs.workflow-validation.result }}
+          RELEASE: ${{ needs.release-config.result }}
+          BUILD_REQUIRED: ${{ needs.classify.outputs.build }}
+          BUILD: ${{ needs.check.result }}
+        run: |
+          test "$CLASSIFY" = success
+          test "$WORKFLOWS" = success
+          test "$RELEASE" = success
+          if [ "$BUILD_REQUIRED" = true ]; then
+            test "$BUILD" = success
+          else
+            test "$BUILD_REQUIRED" = false
+            test "$BUILD" = skipped
+          fi
