@@ -33,7 +33,7 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/rpmbuild/SOURCES"
           version=$(cat VERSION)
-          git archive --format=tar.gz --prefix="vigil-$version/" HEAD > "$RUNNER_TEMP/rpmbuild/SOURCES/vigil-$version.tar.gz"
+          git -c safe.directory="$GITHUB_WORKSPACE" archive --format=tar.gz --prefix="vigil-$version/" HEAD > "$RUNNER_TEMP/rpmbuild/SOURCES/vigil-$version.tar.gz"
           rpmbuild -ba --define "_topdir $RUNNER_TEMP/rpmbuild" packaging/vigil.spec
   release-config:
     runs-on: ubuntu-latest
