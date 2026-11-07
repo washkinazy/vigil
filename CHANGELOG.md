@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/washkinazy/vigil/compare/v0.6.0...v0.6.1) (2026-11-07)
+
+
+### Bug Fixes
+
+* avoid duplicate tray tooltip headings ([#17](https://github.com/washkinazy/vigil/issues/17)) ([035e344](https://github.com/washkinazy/vigil/commit/035e344c07f196bbf9d7c4ac28f92c4ebd76d6c7))
+
 ## [0.6.0](https://github.com/washkinazy/vigil/compare/v0.5.1...v0.6.0) (2026-11-07)
 
 
