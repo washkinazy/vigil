@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/washkinazy/vigil/compare/v0.4.0...v0.5.0) (2026-11-07)
+
+
+### Features
+
+* add a tray indicator with timed idle overrides ([#10](https://github.com/washkinazy/vigil/issues/10)) ([8c5c865](https://github.com/washkinazy/vigil/commit/8c5c865c0ab3f16aec26481e13be4dfeee2d1cb3))
+
 ## [0.4.0](https://github.com/washkinazy/vigil/compare/v0.3.1...v0.4.0) (2026-11-07)
 
 
