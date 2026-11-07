@@ -1,3 +1,4 @@
+mod watcher;
 use std::{path::PathBuf, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -102,7 +103,7 @@ async fn start() -> Result<(), String> {
     }
     if args == ["--help"] || args == ["-h"] {
         println!(
-            "vigilctl [--socket PATH] COMMAND\n\nstatus [--json]\nwaybar [--watch]\nkeep-awake [DURATION] [--scope display,lock,suspend] [--reason TEXT]\nrelease ID\nautomatic\ntoggle\nreload\nlock\nsuspend\nwake\n\nDurations: 30s, 20m, 1h, 1d. Each keep-awake prints its ID. Omitted duration lasts until released or restart.\nrelease removes one request; automatic clears all manual requests.\ntoggle controls its own all-action request and preserves other requests.\nExplicit lock/suspend commands bypass activity inhibitors; suspend requires confirmed lock."
+            "vigilctl [--socket PATH] COMMAND\n\nstatus [--json]\nexplain display|lock|suspend\nwaybar [--watch]\nkeep-awake [DURATION] [--scope display,lock,suspend] [--reason TEXT]\nrelease ID\nautomatic\ntoggle\nreload\nlock\nsuspend\nwake\n\nDurations: 30s, 20m, 1h, 1d. Each keep-awake prints its ID. Omitted duration lasts until released.\nrelease removes one request; automatic clears all manual requests.\ntoggle controls its own all-action request and preserves other requests.\nExplicit lock/suspend commands bypass activity inhibitors; suspend requires confirmed lock."
         );
         return Ok(());
     }
@@ -122,6 +123,14 @@ async fn start() -> Result<(), String> {
         {
             Request::Status
         }
+        "explain" if args.len() == 2 => Request::Explain {
+            action: match args[1].as_str() {
+                "display" => vigil_core::Action::Display,
+                "lock" => vigil_core::Action::Lock,
+                "suspend" => vigil_core::Action::Suspend,
+                _ => return Err("explain requires display, lock, or suspend".into()),
+            },
+        },
         "automatic" if args.len() == 1 => Request::Automatic,
         "release" if args.len() == 2 => Request::Release {
             id: args[1].clone(),
@@ -172,7 +181,15 @@ async fn start() -> Result<(), String> {
                 .join("vigil/control.sock")
         }
     };
+    let watcher = if cmd == "waybar" && args.len() == 2 {
+        Some(watcher::Executable::current()?)
+    } else {
+        None
+    };
     loop {
+        if watcher.as_ref().is_some_and(watcher::Executable::replaced) {
+            return Ok(());
+        }
         let response = request(&path, request_kind.clone()).await;
         if cmd == "waybar" {
             match response {
@@ -209,10 +226,9 @@ async fn start() -> Result<(), String> {
                     println!(
                         "  {}: {}",
                         manual.id,
-                        manual.remaining_seconds.map_or_else(
-                            || "until released or restart".into(),
-                            |n| format!("{n}s remaining")
-                        )
+                        manual
+                            .remaining_seconds
+                            .map_or_else(|| "until released".into(), |n| format!("{n}s remaining"))
                     );
                 }
                 for t in &s.timers {

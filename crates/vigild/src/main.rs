@@ -1,6 +1,7 @@
 mod actions;
 mod idle_hint;
 mod logind;
+mod manual_store;
 mod observers;
 mod sensors;
 mod wayland;
@@ -45,6 +46,7 @@ struct Runtime {
     sleeping: bool,
     blanked: bool,
     manual: ManualInhibitors,
+    manual_store: Option<manual_store::Store>,
     last_action: Option<String>,
     idle_hint: Option<bool>,
     idle_hint_tx: watch::Sender<Option<bool>>,
@@ -232,12 +234,13 @@ async fn start() -> Result<(), String> {
     let mut check = false;
     let mut path = config_path();
     let mut socket = None;
+    let mut state_file = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => {
                 println!(
-                    "vigild [--config PATH] [--socket PATH] [--dry-run] [--check-config]\nNative Wayland session idle manager. Configuration: TOML."
+                    "vigild [--config PATH] [--socket PATH] [--state-file PATH] [--dry-run] [--check-config]\nNative Wayland session idle manager. Configuration: TOML."
                 );
                 return Ok(());
             }
@@ -246,6 +249,11 @@ async fn start() -> Result<(), String> {
                 return Ok(());
             }
             "--dry-run" => dry = true,
+            "--state-file" => {
+                state_file = Some(PathBuf::from(
+                    args.next().ok_or("--state-file requires a path")?,
+                ))
+            }
             "--check-config" => check = true,
             "--config" => path = PathBuf::from(args.next().ok_or("--config requires a path")?),
             "--socket" => {
@@ -264,6 +272,22 @@ async fn start() -> Result<(), String> {
         return Ok(());
     }
     let config_file = path;
+    let manual_store = if dry {
+        None
+    } else {
+        // Custom sockets get their own state, avoiding interference with the session daemon.
+        let state_path =
+            state_file.or_else(|| socket.as_ref().map(|p| p.with_extension("manual.json")));
+        Some(manual_store::Store::open(match state_path {
+            Some(p) => p,
+            None => manual_store::default_path()?,
+        })?)
+    };
+    let manual = match &manual_store {
+        Some(store) => store.load(0)?,
+        None => ManualInhibitors::default(),
+    };
+
     let path = match socket {
         Some(p) => p,
         None => socket_path()?,
@@ -292,7 +316,8 @@ async fn start() -> Result<(), String> {
         effective_idle: false,
         sleeping: false,
         blanked: false,
-        manual: ManualInhibitors::default(),
+        manual,
+        manual_store,
         last_action: None,
         idle_hint: None,
         idle_hint_tx,
@@ -347,8 +372,94 @@ impl Runtime {
         }
     }
     async fn control(&mut self, request: Request, now: u64) -> Result<String, String> {
+        let changes_manual = matches!(
+            request,
+            Request::Toggle
+                | Request::KeepAwake { .. }
+                | Request::Release { .. }
+                | Request::Automatic
+        );
+        let previous = changes_manual.then(|| self.manual.clone());
+        let result = self.control_inner(request, now).await;
+        if let Some(previous) = previous
+            && result.is_ok()
+        {
+            if let Some(store) = &self.manual_store
+                && let Err(error) = store.save(&self.manual, now)
+            {
+                self.manual = previous;
+                self.health.insert("manual-state".into(), error.clone());
+                return Err(error);
+            }
+            self.health.remove("manual-state");
+        }
+        result
+    }
+    fn explain(&mut self, action: Action, now: u64) -> String {
+        let status = self.status(now);
+        let Some(timer) = status.timers.iter().find(|t| t.action == action) else {
+            return format!("{action:?}: timer unavailable");
+        };
+        let state = if !timer.enabled {
+            "disabled".to_string()
+        } else if self.sleeping {
+            "paused during sleep preparation".into()
+        } else if timer.blocked {
+            "inhibited".into()
+        } else if timer.completed {
+            "completed for this idle cycle".into()
+        } else if !self.input_idle {
+            "waiting for inactivity".into()
+        } else if timer.remaining_seconds == 0 {
+            "due on the next scheduler tick".into()
+        } else {
+            format!(
+                "eligible in {}s ({})",
+                timer.remaining_seconds,
+                match timer.delay {
+                    Some(vigil_core::TimerDelay::ReleaseGrace) => "release grace",
+                    Some(vigil_core::TimerDelay::Retry) => "retry delay",
+                    None => "idle timeout",
+                }
+            )
+        };
+        let mut lines = vec![format!(
+            "{action:?}: {state}{}",
+            if self.dry { " (dry-run)" } else { "" }
+        )];
+        for inhibitor in status
+            .inhibitors
+            .iter()
+            .filter(|i| i.scope.contains(&action))
+        {
+            let expiry = status
+                .manual_inhibitors
+                .iter()
+                .find(|m| m.id == inhibitor.id)
+                .and_then(|m| m.remaining_seconds)
+                .map_or(String::new(), |n| format!(" ({n}s remaining)"));
+            lines.push(format!(
+                "  {}: {}{expiry}",
+                inhibitor.id,
+                inhibitor.reason.escape_default()
+            ));
+        }
+        for (backend, reason) in status.health {
+            lines.push(format!(
+                "  Warning: {}: {}",
+                backend.escape_default(),
+                reason.escape_default()
+            ));
+        }
+        if let Some(last) = status.last_action {
+            lines.push(format!("  Last action: {}", last.escape_default()));
+        }
+        lines.join("\n")
+    }
+    async fn control_inner(&mut self, request: Request, now: u64) -> Result<String, String> {
         match request {
             Request::Status => Ok("status".into()),
+            Request::Explain { action } => Ok(self.explain(action, now)),
             Request::Reload => {
                 let text = std::fs::read_to_string(&self.config_file).map_err(|e| e.to_string())?;
                 let next = Config::parse(&text)?;
@@ -527,10 +638,99 @@ mod tests {
             sleeping: false,
             blanked: false,
             manual: ManualInhibitors::default(),
+            manual_store: None,
             last_action: None,
             idle_hint: None,
             idle_hint_tx: watch::channel(None).0,
         }
+    }
+    #[tokio::test]
+    async fn explain_reports_scopes_grace_retry_and_health_without_actions() {
+        let mut r = runtime();
+        r.input_idle = true;
+        r.manual
+            .add(0, Some(5000), vec![Action::Suspend], "Backup".into())
+            .unwrap();
+        let message = r
+            .control(
+                Request::Explain {
+                    action: Action::Suspend,
+                },
+                2000,
+            )
+            .await
+            .unwrap();
+        assert!(message.contains("Suspend: inhibited"));
+        assert!(message.contains("Backup (3000s remaining)"));
+        assert!(!r.explain(Action::Display, 2000).contains("Backup"));
+        r.manual.clear();
+        assert!(
+            r.explain(Action::Suspend, 2001)
+                .contains("60s (release grace)")
+        );
+        r.policy.failed(Action::Display, 2001, &r.c);
+        assert!(
+            r.explain(Action::Display, 2001)
+                .contains("30s (retry delay)")
+        );
+        r.c.timeouts.lock_seconds = 0;
+        assert!(r.explain(Action::Lock, 2001).contains("disabled"));
+        r.health.insert("test-backend".into(), "unavailable".into());
+        assert!(
+            r.explain(Action::Lock, 2001)
+                .contains("Warning: test-backend: unavailable")
+        );
+        r.policy.complete(Action::Display);
+        assert!(r.explain(Action::Display, 2100).contains("completed"));
+        r.sleeping = true;
+        assert!(
+            r.explain(Action::Display, 2100)
+                .contains("sleep preparation")
+        );
+        assert!(r.last_action.is_none());
+    }
+    #[tokio::test]
+    async fn persistent_commands_restore_and_failed_writes_roll_back() {
+        let dir = std::env::temp_dir().join(format!("vigil-runtime-state-{}", std::process::id()));
+        let path = dir.join("manual.json");
+        let mut r = runtime();
+        // Fake action adapters: exercise real state I/O without desktop actions.
+        r.manual_store = Some(manual_store::Store::open(path.clone()).unwrap());
+        let id = r
+            .control(
+                Request::KeepAwake {
+                    seconds: None,
+                    scope: ACTIONS.to_vec(),
+                    reason: "Persistent".into(),
+                },
+                0,
+            )
+            .await
+            .unwrap();
+        let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+        std::fs::create_dir(&temp).unwrap();
+        assert!(r.control(Request::Automatic, 1).await.is_err());
+        assert_eq!(r.status(1).manual_inhibitors[0].id, id);
+        assert!(r.health.contains_key("manual-state"));
+        std::fs::remove_dir(&temp).unwrap();
+        drop(r);
+        let mut r = runtime();
+        let store = manual_store::Store::open(path.clone()).unwrap();
+        r.manual = store.load(0).unwrap();
+        r.manual_store = Some(store);
+        assert_eq!(r.status(0).manual_inhibitors[0].id, id);
+        r.control(Request::Release { id }, 0).await.unwrap();
+        assert!(
+            r.manual_store
+                .as_ref()
+                .unwrap()
+                .load(0)
+                .unwrap()
+                .status(0)
+                .is_empty()
+        );
+        drop(r);
+        std::fs::remove_dir_all(dir).unwrap();
     }
     #[tokio::test]
     async fn continuous_input_never_runs_idle_actions() {

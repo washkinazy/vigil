@@ -20,7 +20,7 @@ Audio scopes and all timeouts are configurable. Set a timeout to zero to disable
 that action. Expired/released inhibitors give affected actions at least 60 seconds
 of grace, or their remaining ordinary idle timeout, whichever is longer. An action
 runs once per idle cycle; failures retry after 30 seconds. Input and resume reset
-timers. Restart starts a fresh idle cycle and clears manual inhibitors.
+timers. Restart starts a fresh idle cycle and restores manual inhibitors.
 
 Vigil uses native `ext-idle-notify-v1` **version 2** notifications, including the
 input-only variant, to distinguish physical inactivity from compositor inhibition.
@@ -114,9 +114,10 @@ Vigil's own suspend timer. Dry-run never writes IdleHint.
 ```sh
 vigilctl status
 vigilctl status --json
+vigilctl explain suspend           # blockers, timer state, and backend warnings
 vigilctl keep-awake 1h --reason "Presentation"
 vigilctl keep-awake 30m --scope suspend --reason "Download"
-vigilctl keep-awake                 # until released or daemon restart
+vigilctl keep-awake                 # until released
 # Each keep-awake prints an ID, for example manual:1.
 vigilctl release manual:1           # release only that request
 vigilctl automatic                 # clear all manual requests
@@ -136,7 +137,25 @@ keybinding cannot accidentally clear a download or presentation request.
 activity still applies. `status` shows request IDs and remaining times;
 `status --json` exposes them in `manual_inhibitors` (a null `remaining_seconds`
 means no expiration). Reasons must be nonblank, at most 256 bytes, and contain
-no control characters. IDs are valid only for the current daemon process.
+no control characters. IDs are preserved across daemon restarts.
+
+Manual requests, including the toggle, are saved in
+`$XDG_STATE_HOME/vigil/manual.json` (normally `~/.local/state/vigil/manual.json`).
+Timed requests retain their expiration; untimed requests survive restarts and
+logins until released or cleared with `automatic`. State is written atomically
+before a command reports success. A failed save leaves the previous requests
+intact and reports an error. Invalid saved state prevents startup and is left
+untouched for recovery; remove that file to explicitly discard saved requests.
+Only manual requests are saved, never observed application activity.
+
+`vigild --state-file PATH` selects another private state file. With a custom
+`--socket`, the default state file is beside that socket with a `.manual.json`
+extension. Dry-run instances neither read nor write saved state.
+
+`vigilctl explain display|lock|suspend` reports the daemon's current automatic
+policy decision, scoped inhibitors, manual expiration, idle timeout, release
+grace or retry delay, and backend warnings. It does not perform an action or
+predict future activity. Explicit `lock` and `suspend` still bypass idle policy.
 
 The Waybar output is newline-delimited JSON with escaped tooltips containing a
 compact list of activity reasons. Duplicate media sources are combined; detailed
@@ -163,6 +182,11 @@ inhibitors. A disconnected daemon shows a warning with the `error` class.
 
 Replace Waybar's `idle_inhibitor` module with `custom/vigil` to use this button.
 `vigilctl toggle` is also suitable for a keybinding.
+
+The watcher checks its executable identity on the existing two-second refresh
+cycle. After an atomic package replacement it exits, allowing Waybar's
+`restart-interval` to launch the updated client. The daemon and Waybar itself
+are not restarted. Restart the Vigil service separately after package upgrades.
 
 The socket is `$XDG_RUNTIME_DIR/vigil/control.sock`, inside a private directory.
 Both binaries accept `--socket PATH`; its existing parent must be private.
@@ -209,8 +233,9 @@ validation because it interrupts the desktop.
 - Unavailable Wayland observation blocks all automatic actions; unavailable
   PipeWire observation blocks suspend. Other backend failures appear in health.
   Missing MPRIS/fullscreen/logind observations cannot reconstruct unknown activity.
-- Manual inhibitors are process-local and are cleared by a daemon restart.
-  They survive configuration reloads; restart persistence is not implemented.
+- Persisted expirations use wall-clock deadlines across restarts. System clock
+  changes can affect restored durations. Running timers
+  remain monotonic.
 - Night-color control belongs to the desktop's Redshift/Gammastep configuration;
   Vigil does not change it.
 - Niri is the supported compositor. Other compositors need compatible idle

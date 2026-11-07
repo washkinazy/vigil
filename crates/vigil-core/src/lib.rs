@@ -170,12 +170,20 @@ pub struct Timer {
     pub blocked: bool,
     pub completed: bool,
     pub remaining_seconds: u64,
+    pub delay: Option<TimerDelay>,
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TimerDelay {
+    ReleaseGrace,
+    Retry,
 }
 #[derive(Debug, Clone)]
 struct ActionState {
     completed: bool,
     blocked: bool,
     not_before: u64,
+    delay: Option<TimerDelay>,
 }
 #[derive(Debug, Clone)]
 pub struct Policy {
@@ -195,6 +203,7 @@ impl Policy {
                             completed: false,
                             blocked: false,
                             not_before: now,
+                            delay: None,
                         },
                     )
                 })
@@ -206,6 +215,7 @@ impl Policy {
         for s in self.states.values_mut() {
             s.completed = false;
             s.not_before = now;
+            s.delay = None;
         }
     }
     pub fn elapsed(&self, now: u64) -> u64 {
@@ -219,6 +229,7 @@ impl Policy {
                 let blocked = inhibitors.iter().any(|i| i.scope.contains(&a));
                 if s.blocked && !blocked {
                     s.not_before = now.saturating_add(c.timeouts.release_grace_seconds);
+                    s.delay = Some(TimerDelay::ReleaseGrace);
                 }
                 if blocked {
                     s.completed = false;
@@ -234,6 +245,13 @@ impl Policy {
                     blocked,
                     completed: s.completed,
                     remaining_seconds: deadline.saturating_sub(now),
+                    delay: if s.not_before > now
+                        && s.not_before >= self.last_activity.saturating_add(c.timeout(a))
+                    {
+                        s.delay
+                    } else {
+                        None
+                    },
                 }
             })
             .collect()
@@ -242,13 +260,14 @@ impl Policy {
         self.states.get_mut(&a).expect("action exists").completed = true;
     }
     pub fn failed(&mut self, a: Action, now: u64, c: &Config) {
-        self.states.get_mut(&a).expect("action exists").not_before =
-            now.saturating_add(c.timeouts.retry_seconds);
+        let state = self.states.get_mut(&a).expect("action exists");
+        state.not_before = now.saturating_add(c.timeouts.retry_seconds);
+        state.delay = Some(TimerDelay::Retry);
     }
 }
 
-/// Process-local manual inhibitors, with deadlines on the daemon's monotonic clock.
-#[derive(Debug, Default)]
+/// Manual inhibitors with deadlines on the daemon's monotonic clock.
+#[derive(Debug, Default, Clone)]
 pub struct ManualInhibitors {
     next_id: u64,
     entries: BTreeMap<String, (Option<u64>, String, Vec<Action>)>,
@@ -260,7 +279,103 @@ pub struct ManualStatus {
     pub scope: Vec<Action>,
     pub remaining_seconds: Option<u64>,
 }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManualSnapshot {
+    version: u32,
+    next_id: u64,
+    entries: Vec<SavedManual>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SavedManual {
+    id: String,
+    reason: String,
+    scope: Vec<Action>,
+    expires_at: Option<u64>,
+}
+impl ManualSnapshot {
+    /// Existing IDs retain their original absolute expiry, regardless of clock adjustments.
+    pub fn preserve_expirations(&mut self, previous: &Self) {
+        let deadlines: BTreeMap<_, _> = previous
+            .entries
+            .iter()
+            .map(|m| (&m.id, m.expires_at))
+            .collect();
+        for entry in &mut self.entries {
+            if let Some(expiry) = deadlines.get(&entry.id) {
+                entry.expires_at = *expiry;
+            }
+        }
+    }
+}
 impl ManualInhibitors {
+    pub fn snapshot(&self, now: u64, unix_now: u64) -> Result<ManualSnapshot, String> {
+        let entries = self
+            .status(now)
+            .into_iter()
+            .map(|m| {
+                Ok(SavedManual {
+                    id: m.id,
+                    reason: m.reason,
+                    scope: m.scope,
+                    expires_at: m
+                        .remaining_seconds
+                        .map(|n| unix_now.checked_add(n).ok_or("expiration overflow"))
+                        .transpose()?,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(ManualSnapshot {
+            version: 1,
+            next_id: self.next_id,
+            entries,
+        })
+    }
+    pub fn restore(snapshot: ManualSnapshot, now: u64, unix_now: u64) -> Result<Self, String> {
+        if snapshot.version != 1 {
+            return Err("unsupported manual state version".into());
+        }
+        let mut result = Self {
+            next_id: snapshot.next_id,
+            entries: BTreeMap::new(),
+        };
+        for saved in snapshot.entries {
+            let valid_id = saved.id == "manual:toggle"
+                || saved
+                    .id
+                    .strip_prefix("manual:")
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .is_some_and(|n| {
+                        n > 0 && n <= result.next_id && saved.id == format!("manual:{n}")
+                    });
+            if !valid_id
+                || saved.scope.is_empty()
+                || saved.reason.trim().is_empty()
+                || saved.reason.len() > 256
+                || saved.reason.chars().any(char::is_control)
+                || (saved.id == "manual:toggle"
+                    && (saved.expires_at.is_some() || saved.scope != ACTIONS))
+            {
+                return Err("invalid saved manual inhibitor".into());
+            }
+            if result.entries.contains_key(&saved.id) {
+                return Err("duplicate saved manual inhibitor".into());
+            }
+            let until = match saved.expires_at {
+                Some(expiry) if expiry <= unix_now => continue,
+                Some(expiry) => Some(
+                    now.checked_add(expiry - unix_now)
+                        .ok_or("expiration overflow")?,
+                ),
+                None => None,
+            };
+            result
+                .entries
+                .insert(saved.id, (until, saved.reason, saved.scope));
+        }
+        Ok(result)
+    }
     pub fn expire(&mut self, now: u64) {
         self.entries
             .retain(|_, (until, _, _)| until.is_none_or(|until| now < until));
@@ -329,6 +444,9 @@ impl ManualInhibitors {
 #[serde(tag = "command", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Request {
     Status,
+    Explain {
+        action: Action,
+    },
     KeepAwake {
         seconds: Option<u64>,
         scope: Vec<Action>,
@@ -501,5 +619,103 @@ mod manual_tests {
         assert!(m.status(30).is_empty());
         let next = m.add(30, None, ACTIONS.to_vec(), "Next".into()).unwrap();
         assert_ne!(next, id);
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+    #[test]
+    fn restart_preserves_ids_deadlines_toggle_and_counter() {
+        let mut manual = ManualInhibitors::default();
+        let timed = manual
+            .add(10, Some(60), vec![Action::Suspend], "Backup".into())
+            .unwrap();
+        let indefinite = manual
+            .add(10, None, ACTIONS.to_vec(), "Presentation".into())
+            .unwrap();
+        manual.toggle();
+        let snapshot = manual.snapshot(20, 1000).unwrap();
+        let mut restored = ManualInhibitors::restore(snapshot, 0, 1020).unwrap();
+        let status = restored.status(0);
+        assert_eq!(
+            status
+                .iter()
+                .find(|m| m.id == timed)
+                .unwrap()
+                .remaining_seconds,
+            Some(30)
+        );
+        assert!(status.iter().any(|m| m.id == indefinite));
+        assert!(status.iter().any(|m| m.id == "manual:toggle"));
+        // A second save/restart must not grant another 60 seconds.
+        restored =
+            ManualInhibitors::restore(restored.snapshot(10, 1030).unwrap(), 0, 1040).unwrap();
+        assert_eq!(
+            restored
+                .status(0)
+                .iter()
+                .find(|m| m.id == timed)
+                .unwrap()
+                .remaining_seconds,
+            Some(10)
+        );
+        restored.expire(10);
+        assert!(!restored.status(10).iter().any(|m| m.id == timed));
+        restored.clear();
+        let mut restored =
+            ManualInhibitors::restore(restored.snapshot(10, 1050).unwrap(), 0, 1100).unwrap();
+        assert!(restored.status(0).is_empty());
+        assert_eq!(
+            restored
+                .add(0, None, ACTIONS.to_vec(), "New".into())
+                .unwrap(),
+            "manual:3"
+        );
+    }
+    #[test]
+    fn saving_other_requests_does_not_move_existing_expirations() {
+        let mut manual = ManualInhibitors::default();
+        manual
+            .add(0, Some(100), ACTIONS.to_vec(), "Original".into())
+            .unwrap();
+        let previous = manual.snapshot(0, 1000).unwrap();
+        // Simulate suspend/clock movement before a new request is created.
+        manual
+            .add(10, Some(100), ACTIONS.to_vec(), "New".into())
+            .unwrap();
+        let mut next = manual.snapshot(10, 2000).unwrap();
+        next.preserve_expirations(&previous);
+        assert_eq!(
+            next.entries
+                .iter()
+                .find(|m| m.id == "manual:1")
+                .unwrap()
+                .expires_at,
+            Some(1100)
+        );
+        assert_eq!(
+            next.entries
+                .iter()
+                .find(|m| m.id == "manual:2")
+                .unwrap()
+                .expires_at,
+            Some(2100)
+        );
+    }
+    #[test]
+    fn expired_while_stopped_is_not_restored_and_invalid_state_is_rejected() {
+        let mut manual = ManualInhibitors::default();
+        manual
+            .add(0, Some(10), ACTIONS.to_vec(), "Timed".into())
+            .unwrap();
+        let restored = ManualInhibitors::restore(manual.snapshot(0, 100).unwrap(), 0, 111).unwrap();
+        assert!(restored.status(0).is_empty());
+        let mut snapshot = manual.snapshot(0, 100).unwrap();
+        snapshot.version = 99;
+        assert!(ManualInhibitors::restore(snapshot, 0, 100).is_err());
+        let mut snapshot = manual.snapshot(0, 100).unwrap();
+        snapshot.entries[0].id = "audio:1".into();
+        assert!(ManualInhibitors::restore(snapshot, 0, 100).is_err());
     }
 }
