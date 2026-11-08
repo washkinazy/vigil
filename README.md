@@ -21,6 +21,8 @@ vigild --check-config
 This installs to `~/.local/bin` and creates `~/.config/vigil/config.toml` if
 missing. Edit it using [config.example.toml](config.example.toml) as a reference.
 Installation preserves existing configuration and does not start services.
+After upgrading, run `systemctl --user restart vigil.service`; restart the tray
+with `systemctl --user try-restart vigil-tray.service` if it is running.
 
 After testing with `just smoke`, stop your previous idle manager and audio
 inhibitor, then start Vigil:
@@ -69,13 +71,13 @@ timeout to `0` to disable it.
   default. Audio and media scopes are configurable.
 
 Input and resume reset idle timers. When the last inhibitor for an action clears,
-that action starts a fresh idle timeout. Explicit lock/suspend commands bypass activity
-inhibition; Vigil confirms the lock before initiating suspend.
+that action starts a fresh idle timeout. Explicit lock/suspend commands bypass
+activity inhibition; Vigil confirms the lock before initiating suspend.
 
 Firefox’s known `speech-dispatcher-dummy` and `sd_dummy` streams are always
 excluded; no configuration is needed. Paused, unlinked, and muted playback is
-also ignored, but other running streams can still carry silence. MPRIS cannot reliably distinguish music from video. Backend
-warnings appear in `vigilctl status`.
+also ignored, but other running streams can still carry silence. MPRIS cannot
+reliably distinguish music from video. Backend warnings appear in `vigilctl status`.
 
 Upgrading from 0.5: saved manual requests are no longer restored; `release`,
 `--scope`, and `--reason` are removed. Old `ignore_audio` and
