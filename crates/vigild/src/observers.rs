@@ -183,30 +183,38 @@ async fn session_bus() -> Result<Connection, String> {
         .await
         .map_err(|e| e.to_string())
 }
-async fn media_snapshot(
-    bus: &Connection,
-    c: &ActivityConfig,
-) -> Result<(Vec<Inhibitor>, Option<String>), String> {
-    let dbus = zbus::fdo::DBusProxy::new(bus)
+type MediaProperties = (
+    String,
+    std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+    Vec<String>,
+);
+
+struct MediaPlayer {
+    owner: String,
+    playback: Result<String, String>,
+}
+async fn playback(bus: &Connection, owner: &str) -> Result<String, String> {
+    let player = Proxy::new(
+        bus,
+        owner,
+        "/org/mpris/MediaPlayer2",
+        "org.mpris.MediaPlayer2.Player",
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    player
+        .get_property::<String>("PlaybackStatus")
         .await
-        .map_err(|e| e.to_string())?;
-    let names = dbus.list_names().await.map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())
+}
+fn media_state(
+    players: &BTreeMap<String, MediaPlayer>,
+    c: &ActivityConfig,
+) -> (Vec<Inhibitor>, Option<String>) {
     let mut list = Vec::new();
     let mut errors = Vec::new();
-    for name in names {
-        let name = name.as_str();
-        if !name.starts_with("org.mpris.MediaPlayer2.") {
-            continue;
-        }
-        let player = Proxy::new(
-            bus,
-            name,
-            "/org/mpris/MediaPlayer2",
-            "org.mpris.MediaPlayer2.Player",
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-        match player.get_property::<String>("PlaybackStatus").await {
+    for (name, player) in players {
+        match &player.playback {
             Ok(status) if status == "Playing" => list.push(Inhibitor {
                 id: format!("mpris:{name}"),
                 reason: format!(
@@ -216,10 +224,10 @@ async fn media_snapshot(
                 scope: c.media_scope.clone(),
             }),
             Ok(_) => {}
-            Err(e) => errors.push(format!("{name}: {e}")),
+            Err(error) => errors.push(format!("{name}: {error}")),
         }
     }
-    Ok((list, (!errors.is_empty()).then(|| errors.join("; "))))
+    (list, (!errors.is_empty()).then(|| errors.join("; ")))
 }
 async fn mpris(tx: &Sender, c: &ActivityConfig) -> Result<(), String> {
     mpris_on_bus(tx, c, session_bus().await?).await
@@ -244,20 +252,66 @@ async fn mpris_on_bus(tx: &Sender, c: &ActivityConfig, bus: Connection) -> Resul
         .receive_name_owner_changed()
         .await
         .map_err(|e| e.to_string())?;
+    // Subscribe before the initial snapshot so lifecycle changes are not lost.
+    let mut players = BTreeMap::new();
+    for name in dbus.list_names().await.map_err(|e| e.to_string())? {
+        if !name.as_str().starts_with("org.mpris.MediaPlayer2.") {
+            continue;
+        }
+        // A player may disappear between listing names and resolving its owner.
+        let owner = match dbus.get_name_owner(name.clone().into()).await {
+            Ok(owner) => owner.to_string(),
+            Err(zbus::fdo::Error::NameHasNoOwner(_)) => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        let playback = playback(&bus, &owner).await;
+        players.insert(name.to_string(), MediaPlayer { owner, playback });
+    }
     loop {
-        let (list, error) = media_snapshot(&bus, c).await?;
+        let (list, error) = media_state(&players, c);
         tx.send(("mpris", list, error))
             .await
             .map_err(|e| e.to_string())?;
         loop {
             tokio::select! {
                 message = properties.next() => {
-                    message.ok_or("MPRIS signal stream ended")?.map_err(|e| e.to_string())?;
+                    let message = message.ok_or("MPRIS signal stream ended")?.map_err(|e| e.to_string())?;
+                    let header = message.header();
+                    let Some(sender) = header.sender() else { continue; };
+                    if !players.values().any(|p| p.owner == sender.as_str()) { continue; }
+                    let (interface, mut changed, invalidated): MediaProperties =
+                        message.body().deserialize().map_err(|e| e.to_string())?;
+                    if interface != "org.mpris.MediaPlayer2.Player" { continue; }
+                    let next = if let Some(value) = changed.remove("PlaybackStatus") {
+                        String::try_from(value).map_err(|e| e.to_string())
+                    } else if invalidated.iter().any(|key| key == "PlaybackStatus") {
+                        playback(&bus, sender.as_str()).await
+                    } else { continue; };
+                    for player in players.values_mut().filter(|p| p.owner == sender.as_str()) {
+                        player.playback = next.clone();
+                    }
                     break;
                 }
                 message = owners.next() => {
                     let message = message.ok_or("D-Bus owner signal stream ended")?;
-                    if message.args().map_err(|e| e.to_string())?.name().as_str().starts_with("org.mpris.MediaPlayer2.") { break; }
+                    let args = message.args().map_err(|e| e.to_string())?;
+                    let name = args.name().as_str();
+                    if !name.starts_with("org.mpris.MediaPlayer2.") { continue; }
+                    let old = args.old_owner().as_ref().map(|o| o.as_str());
+                    let new = args.new_owner().as_ref().map(|o| o.as_str());
+                    if let Some(player) = players.get(name) {
+                        // Ignore events already reflected in the snapshot or from an older owner.
+                        if Some(player.owner.as_str()) == new || Some(player.owner.as_str()) != old {
+                            continue;
+                        }
+                    }
+                    if let Some(owner) = new {
+                        let playback = playback(&bus, owner).await;
+                        players.insert(name.to_string(), MediaPlayer {
+                            owner: owner.into(), playback,
+                        });
+                    } else { players.remove(name); }
+                    break;
                 }
             }
         }
@@ -476,11 +530,12 @@ mod tests {
             &self.status
         }
     }
-    struct BrokenPlayer;
+    struct BrokenPlayer(std::sync::Arc<std::sync::atomic::AtomicUsize>);
     #[zbus::interface(name = "org.mpris.MediaPlayer2.Player")]
     impl BrokenPlayer {
         #[zbus(property)]
         fn playback_status(&self) -> zbus::fdo::Result<String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err(zbus::fdo::Error::Failed("player unavailable".into()))
         }
     }
@@ -513,11 +568,15 @@ mod tests {
             .build()
             .await
             .unwrap();
+        let broken_reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let broken = zbus::connection::Builder::address(address)
             .unwrap()
             .name("org.mpris.MediaPlayer2.Broken")
             .unwrap()
-            .serve_at("/org/mpris/MediaPlayer2", BrokenPlayer)
+            .serve_at(
+                "/org/mpris/MediaPlayer2",
+                BrokenPlayer(broken_reads.clone()),
+            )
             .unwrap()
             .build()
             .await
@@ -537,6 +596,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(error.unwrap().contains("Broken"));
+        let initial_broken_reads = broken_reads.load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(list.len(), 1);
         let player = service
             .object_server()
@@ -567,7 +627,91 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(list.len(), 1);
+        // Invalidations refresh only the affected player; unrelated signals do no work.
+        player.get_mut().await.status = "Paused".into();
         service
+            .emit_signal(
+                None::<&str>,
+                "/org/mpris/MediaPlayer2",
+                "org.freedesktop.DBus.Properties",
+                "PropertiesChanged",
+                &(
+                    "org.mpris.MediaPlayer2.Player",
+                    std::collections::HashMap::<String, zbus::zvariant::OwnedValue>::new(),
+                    vec!["PlaybackStatus"],
+                ),
+            )
+            .await
+            .unwrap();
+        let (_, list, _) = timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(list.is_empty());
+        assert_eq!(
+            broken_reads.load(std::sync::atomic::Ordering::SeqCst),
+            initial_broken_reads
+        );
+        service
+            .emit_signal(
+                None::<&str>,
+                "/org/mpris/MediaPlayer2",
+                "org.freedesktop.DBus.Properties",
+                "PropertiesChanged",
+                &(
+                    "org.mpris.MediaPlayer2.Player",
+                    std::collections::HashMap::<String, zbus::zvariant::OwnedValue>::new(),
+                    vec!["Metadata"],
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(
+            timeout(Duration::from_millis(100), rx.recv())
+                .await
+                .is_err()
+        );
+        service
+            .release_name("org.mpris.MediaPlayer2.VigilTest")
+            .await
+            .unwrap();
+        let (_, list, _) = timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(list.is_empty());
+        let replacement = zbus::connection::Builder::address(address)
+            .unwrap()
+            .name("org.mpris.MediaPlayer2.VigilTest")
+            .unwrap()
+            .serve_at(
+                "/org/mpris/MediaPlayer2",
+                Player {
+                    status: "Playing".into(),
+                },
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let (_, list, _) = timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(list.len(), 1);
+        // The old owner's Paused signal must not overwrite the replacement's Playing state.
+        player
+            .get()
+            .await
+            .playback_status_changed(player.signal_emitter())
+            .await
+            .unwrap();
+        assert!(
+            timeout(Duration::from_millis(100), rx.recv())
+                .await
+                .is_err()
+        );
+        replacement
             .release_name("org.mpris.MediaPlayer2.VigilTest")
             .await
             .unwrap();

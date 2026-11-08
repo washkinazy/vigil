@@ -1,6 +1,6 @@
 //! StatusNotifierItem client. The daemon owns every timer and policy decision.
 use ksni::{
-    TrayMethods,
+    Orientation, TrayMethods,
     menu::{CheckmarkItem, StandardItem},
 };
 use std::{path::PathBuf, time::Duration};
@@ -45,6 +45,16 @@ impl ksni::Tray for Indicator {
     fn activate(&mut self, _x: i32, _y: i32) {
         self.send(Request::Toggle);
     }
+    fn scroll(&mut self, delta: i32, orientation: Orientation) {
+        if !matches!(orientation, Orientation::Vertical) || delta == 0 {
+            return;
+        }
+        if delta > 0 && !self.keep_awake() {
+            self.send(Request::KeepAwake { seconds: None });
+        } else if delta < 0 && self.keep_awake() {
+            self.send(Request::Automatic);
+        }
+    }
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
         icons(
             self.keep_awake()
@@ -79,6 +89,21 @@ impl ksni::Tray for Indicator {
             .into(),
             ksni::MenuItem::Separator,
         ];
+        if let Some(seconds) = self
+            .status
+            .as_ref()
+            .and_then(|s| s.caffeine.as_ref())
+            .and_then(|c| c.remaining_seconds)
+        {
+            menu.push(
+                StandardItem {
+                    label: format!("Keep awake: {} min remaining", seconds.div_ceil(60)),
+                    enabled: false,
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
         menu.extend([30, 60, 90].into_iter().map(|minutes| {
             StandardItem {
                 label: format!("Keep awake for {minutes} minutes"),
@@ -230,6 +255,37 @@ mod tests {
                 matches!(received.recv().await, Some(Request::KeepAwake { seconds: Some(n) }) if n == seconds)
             );
         }
+    }
+    #[tokio::test]
+    async fn scroll_sets_manual_state_and_does_not_extend_a_timed_pause() {
+        let (mut tray, mut received) = indicator();
+        tray.scroll(1, Orientation::Horizontal);
+        tray.scroll(0, Orientation::Vertical);
+        tray.scroll(-1, Orientation::Vertical);
+        assert!(received.try_recv().is_err());
+        tray.scroll(120, Orientation::Vertical);
+        assert!(matches!(
+            received.recv().await,
+            Some(Request::KeepAwake { seconds: None })
+        ));
+        tray.pending = false;
+        tray.status.as_mut().unwrap().caffeine = Some(vigil_core::CaffeineStatus {
+            remaining_seconds: Some(61),
+        });
+        tray.scroll(120, Orientation::Vertical);
+        assert!(received.try_recv().is_err());
+        let menu = tray.menu();
+        let ksni::MenuItem::Standard(item) = &menu[2] else {
+            panic!("missing countdown")
+        };
+        assert_eq!(item.label, "Keep awake: 2 min remaining");
+        assert!(!item.enabled);
+        tray.scroll(-120, Orientation::Vertical);
+        assert!(matches!(received.recv().await, Some(Request::Automatic)));
+        tray.pending = false;
+        tray.status = None;
+        tray.scroll(120, Orientation::Vertical);
+        assert!(received.try_recv().is_err());
     }
     #[test]
     fn icons_have_native_sizes_and_antialiased_edges() {
