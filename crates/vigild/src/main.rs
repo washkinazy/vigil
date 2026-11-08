@@ -219,6 +219,7 @@ struct Pending {
 
 fn config_path() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|path| !path.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config")
