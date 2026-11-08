@@ -14,6 +14,19 @@ with tempfile.TemporaryDirectory(prefix="vigil-smoke-", dir=os.environ["XDG_RUNT
     socket = Path(directory) / "control.sock"
     config = Path(directory) / "config.toml"
     config.write_text((root / "config.example.toml").read_text())
+    # Resolve config paths in child processes without mutating the desktop environment.
+    home = Path(directory) / "home"
+    custom = Path(directory) / "custom-config"
+    for config_home in (None, "", str(custom)):
+        env = dict(os.environ, HOME=str(home))
+        env.pop("XDG_CONFIG_HOME", None)
+        if config_home is not None:
+            env["XDG_CONFIG_HOME"] = config_home
+        expected = (Path(config_home) if config_home else home / ".config") / "vigil/config.toml"
+        expected.parent.mkdir(parents=True, exist_ok=True)
+        expected.write_text(config.read_text())
+        result = subprocess.check_output([str(root / "target/debug/vigild"), "--check-config"], env=env, text=True)
+        assert str(expected) in result
     daemon = subprocess.Popen([
         str(root / "target/debug/vigild"), "--dry-run", "--config",
         str(config), "--socket", str(socket),

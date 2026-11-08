@@ -14,10 +14,13 @@ pub async fn output(argv: &[String], seconds: u64) -> Result<String, String> {
         .map_err(|_| format!("{exe}: timed out"))?
         .map_err(|e| format!("{exe}: {e}"))?;
     if !out.status.success() {
-        return Err(format!(
-            "{exe}: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let detail = stderr.trim();
+        return Err(if detail.is_empty() {
+            format!("{exe}: {}", out.status)
+        } else {
+            format!("{exe}: {}: {detail}", out.status)
+        });
     }
     String::from_utf8(out.stdout).map_err(|e| e.to_string())
 }
@@ -82,7 +85,14 @@ mod tests {
     use super::*;
     #[tokio::test]
     async fn subprocess_failure_and_timeout() {
-        assert!(run(&["false"], 1).await.is_err());
+        assert_eq!(
+            run(&["false"], 1).await.unwrap_err(),
+            "false: exit status: 1"
+        );
+        let error = run(&["sh", "-c", "printf 'failure detail\\n' >&2; exit 7"], 1)
+            .await
+            .unwrap_err();
+        assert_eq!(error, "sh: exit status: 7: failure detail");
         assert!(
             run(&["sleep", "5"], 1)
                 .await
