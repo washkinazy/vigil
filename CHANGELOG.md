@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.2](https://github.com/washkinazy/vigil/compare/v0.6.1...v0.6.2) (2026-11-08)
+
+
+### Bug Fixes
+
+* improve command errors and config path fallback ([#19](https://github.com/washkinazy/vigil/issues/19)) ([e9cceaf](https://github.com/washkinazy/vigil/commit/e9cceaf8fd27ae9d0c8de1c284bfd4255489a8ad))
+
 ## [0.6.1](https://github.com/washkinazy/vigil/compare/v0.6.0...v0.6.1) (2026-11-07)
 
 
