@@ -51,14 +51,10 @@ There is one keep-awake switch. A new duration replaces the previous one; toggli
 it off or restarting the daemon clears it. Application activity still applies
 when keep-awake is off. See `vigilctl --help` for all commands.
 
-For a tray button, enable your panel's tray module and run:
-
-```sh
-systemctl --user start vigil-tray.service
-```
-
-To start it with Niri, add the same startup line above using `vigil-tray.service`.
-Click to toggle; right-click for 30/60/90-minute pauses.
+For a tray button, start `vigil-tray.service` alongside `vigil.service` and enable
+your panel's tray module. Click to toggle; scroll up to enable keep-awake or down
+to disable it.
+Right-click for 30/60/90-minute pauses and the remaining pause time.
 The tray shows Automatic, Keep awake, or Paused with the inhibition reason.
 Alternatively, `vigilctl waybar --watch` provides Waybar JSON output.
 

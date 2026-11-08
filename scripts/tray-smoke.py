@@ -65,6 +65,7 @@ with tempfile.TemporaryDirectory(prefix="vigil-tray-") as directory:
         for minutes in (30, 60, 90):
             click(f"Keep awake for {minutes} minutes")
             wait_for(lambda: f"{minutes} min" in title())
+            assert item(f"Keep awake: {minutes} min remaining")[1]["enabled"]["data"] is False
             current = status()["caffeine"]
             assert minutes * 60 - 10 <= current["remaining_seconds"] <= minutes * 60
         subprocess.check_call(ctl + ["keep-awake", "1h"])
@@ -72,6 +73,16 @@ with tempfile.TemporaryDirectory(prefix="vigil-tray-") as directory:
         click("Keep awake")
         wait_for(lambda: status()["caffeine"] is None)
         wait_for(lambda: "Keep awake" not in title())
+        def scroll(delta):
+            bus("call", name, "/StatusNotifierItem", "org.kde.StatusNotifierItem", "Scroll", "is", str(delta), "vertical")
+        scroll(120)
+        wait_for(lambda: status()["caffeine"] is not None)
+        assert status()["caffeine"]["remaining_seconds"] is None
+        wait_for(lambda: "Keep awake" in title())
+        scroll(-120)
+        wait_for(lambda: status()["caffeine"] is None)
+        wait_for(lambda: "Keep awake" not in title())
+        assert item("Keep awake: 60 min remaining") is None
         daemon.terminate()
         daemon.wait(timeout=5)
         wait_for(lambda: "Unavailable" in title())
