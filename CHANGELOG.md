@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/washkinazy/vigil/compare/v0.6.2...v0.7.0) (2026-11-08)
+
+
+### Features
+
+* cache media players and add tray scroll controls ([#20](https://github.com/washkinazy/vigil/issues/20)) ([2a70e2d](https://github.com/washkinazy/vigil/commit/2a70e2d6351a66fe3bc413a0046c2378736420c0))
+
 ## [0.6.2](https://github.com/washkinazy/vigil/compare/v0.6.1...v0.6.2) (2026-11-08)
 
 
